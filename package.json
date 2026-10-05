@@ -9,7 +9,8 @@
     "dev": "bun --filter '*' dev",
     "dev:server": "bun --cwd apps/server run dev",
     "dev:web": "bun --cwd apps/web run dev",
-    "build": "bun --cwd apps/web run build"
+    "build": "bun --cwd apps/web run build",
+    "test": "bun --cwd apps/server run test"
   },
   "devDependencies": {
     "bun-types": "latest"

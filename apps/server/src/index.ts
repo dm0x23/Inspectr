@@ -4,6 +4,8 @@ import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
 import dotenv from 'dotenv';
 import { healthRoute } from './routes/health';
+import { queuesRoute } from './routes/queues';
+import { startVisibilitySweeper, stopVisibilitySweeper } from './worker/sweeper';
 import './lib/redis'; // Initialize Redis client connection
 
 // Load environment variables
@@ -20,6 +22,8 @@ app.use('*', prettyJSON());
 
 // Mount routes
 app.route('/health', healthRoute);
+app.route('/api/queues', queuesRoute);
+app.route('/queues', queuesRoute);
 
 // Base route info
 app.get('/', (c) => {
@@ -29,9 +33,16 @@ app.get('/', (c) => {
     version: '0.1.0',
     endpoints: {
       health: '/health',
+      queues: '/api/queues',
     },
   });
 });
+
+// Start background visibility sweeper worker (every 1000ms)
+startVisibilitySweeper(1000);
+
+process.on('SIGINT', () => stopVisibilitySweeper());
+process.on('SIGTERM', () => stopVisibilitySweeper());
 
 // 404 Handler
 app.notFound((c) => {
