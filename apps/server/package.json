@@ -1,0 +1,19 @@
+{
+  "name": "@inspectr/server",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "hono": "^4.7.1",
+    "ioredis": "^5.5.0",
+    "nanoid": "^5.0.9"
+  },
+  "devDependencies": {
+    "@types/ioredis": "^5.0.0",
+    "bun-types": "latest"
+  }
+}
