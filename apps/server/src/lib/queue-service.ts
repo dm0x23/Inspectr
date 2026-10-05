@@ -8,21 +8,66 @@ import type {
   CreateQueueInput,
   SendMessageInput,
   MessageMetadata,
+  DLQMessageMetadata,
   ReceiveMessageResponse,
   ReceiveMessagesOptions,
+  RedriveResponse,
 } from '../types/queue';
 
-// Lua script to atomically receive up to N messages from ready queue and place into inflight ZSET
+// Lua script to atomically receive up to N messages from ready queue and place into inflight ZSET.
+// If receiveCount > maxReceiveCount, moves message to DLQ instead of returning to consumer.
 const RECEIVE_MESSAGES_LUA = `
 local readyKey = KEYS[1]
 local inflightKey = KEYS[2]
+local dlqReadyKey = KEYS[3]
+local dlqMetaKey = KEYS[4]
+
 local maxCount = tonumber(ARGV[1])
 local expireAt = tonumber(ARGV[2])
 local qName = ARGV[3]
+local dlqName = ARGV[4]
+local maxReceive = tonumber(ARGV[5]) or 3
+local failedAt = ARGV[6]
+local errorTrace = ARGV[7]
+local nowIso = ARGV[8]
+local qType = ARGV[9] or 'standard'
 
 local results = {}
+local movedToDlq = {}
+local skipped = {}
 
-for i = 1, maxCount do
+-- Ensure DLQ meta exists in Redis if messages are moved to DLQ
+local function ensureDlqMeta()
+  local dlqExists = redis.call('EXISTS', dlqMetaKey)
+  if dlqExists == 0 then
+    redis.call('SADD', 'queues:all', dlqName)
+    redis.call('HSET', dlqMetaKey,
+      'name', dlqName,
+      'type', qType,
+      'visibilityTimeout', '30',
+      'maxReceiveCount', '3',
+      'createdAt', nowIso
+    )
+  end
+end
+
+-- If FIFO, collect all messageGroupIds that are currently in-flight
+local inflightGroups = {}
+if qType == 'fifo' then
+  local currentInflight = redis.call('ZRANGE', inflightKey, 0, -1)
+  for _, ifId in ipairs(currentInflight) do
+    local grp = redis.call('HGET', 'msg:' .. qName .. ':' .. ifId, 'messageGroupId')
+    if grp and grp ~= '' then
+      inflightGroups[grp] = true
+    end
+  end
+end
+
+local safetyLimit = 50
+local iterations = 0
+
+while #results < maxCount and iterations < safetyLimit do
+  iterations = iterations + 1
   local msgId = redis.call('LPOP', readyKey)
   if not msgId then
     break
@@ -30,14 +75,62 @@ for i = 1, maxCount do
 
   local msgKey = 'msg:' .. qName .. ':' .. msgId
   local exists = redis.call('EXISTS', msgKey)
+
   if exists == 1 then
-    redis.call('HINCRBY', msgKey, 'receiveCount', 1)
-    redis.call('ZADD', inflightKey, expireAt, msgId)
-    table.insert(results, msgId)
+    -- Check FIFO group concurrency
+    local canDeliver = true
+    local grp = nil
+    if qType == 'fifo' then
+      grp = redis.call('HGET', msgKey, 'messageGroupId')
+      if grp and grp ~= '' and inflightGroups[grp] then
+        canDeliver = false
+      end
+    end
+
+    if not canDeliver then
+      -- Another message from this group is currently in-flight or already in this batch.
+      -- Defer to preserve strict FIFO ordering per messageGroupId.
+      table.insert(skipped, msgId)
+    else
+      local newReceiveCount = redis.call('HINCRBY', msgKey, 'receiveCount', 1)
+
+      if newReceiveCount > maxReceive then
+        -- Exceeded maxReceiveCount! Move message to DLQ
+        ensureDlqMeta()
+
+        local dlqMsgKey = 'msg:' .. dlqName .. ':' .. msgId
+        redis.call('RENAME', msgKey, dlqMsgKey)
+
+        local reason = 'MaxReceiveCountExceeded (Attempted ' .. newReceiveCount .. ' times)'
+        redis.call('HSET', dlqMsgKey,
+          'failedAt', failedAt,
+          'failureReason', reason,
+          'errorTrace', errorTrace,
+          'sourceQueue', qName
+        )
+
+        redis.call('RPUSH', dlqReadyKey, msgId)
+        table.insert(movedToDlq, msgId)
+      else
+        -- Deliver to consumer
+        redis.call('ZADD', inflightKey, expireAt, msgId)
+        table.insert(results, msgId)
+        if grp and grp ~= '' then
+          inflightGroups[grp] = true
+        end
+      end
+    end
   end
 end
 
-return results
+-- Put any skipped messages back to the front of ready queue in reverse order
+if #skipped > 0 then
+  for i = #skipped, 1, -1 do
+    redis.call('LPUSH', readyKey, skipped[i])
+  end
+end
+
+return { results, movedToDlq }
 `;
 
 // Lua script to atomically acknowledge (delete) message from inflight and delete hash
@@ -92,7 +185,129 @@ end
 return moved
 `;
 
+// Lua script to redrive messages from DLQ back to sourceQueue
+const REDRIVE_LUA = `
+local dlqReadyKey = KEYS[1]
+local dlqInflightKey = KEYS[2]
+local dlqName = ARGV[1]
+local numArgs = #ARGV
+
+local idsToRedrive = {}
+
+if numArgs > 1 then
+  for i = 2, numArgs do
+    table.insert(idsToRedrive, ARGV[i])
+  end
+else
+  local readyIds = redis.call('LRANGE', dlqReadyKey, 0, -1)
+  for _, id in ipairs(readyIds) do
+    table.insert(idsToRedrive, id)
+  end
+  local inflightIds = redis.call('ZRANGE', dlqInflightKey, 0, -1)
+  for _, id in ipairs(inflightIds) do
+    table.insert(idsToRedrive, id)
+  end
+end
+
+local redriven = {}
+
+for _, msgId in ipairs(idsToRedrive) do
+  local dlqMsgKey = 'msg:' .. dlqName .. ':' .. msgId
+  if redis.call('EXISTS', dlqMsgKey) == 1 then
+    local srcQueue = redis.call('HGET', dlqMsgKey, 'sourceQueue')
+    if not srcQueue or srcQueue == '' then
+      srcQueue = string.gsub(dlqName, '%-dlq$', '')
+    end
+
+    local srcMsgKey = 'msg:' .. srcQueue .. ':' .. msgId
+    local srcReadyKey = 'queue:' .. srcQueue .. ':ready'
+
+    -- Move hash to source queue
+    redis.call('RENAME', dlqMsgKey, srcMsgKey)
+    -- Reset receiveCount = 0 and clear error metadata
+    redis.call('HSET', srcMsgKey, 'receiveCount', '0')
+    redis.call('HDEL', srcMsgKey, 'failedAt', 'failureReason', 'errorTrace', 'sourceQueue')
+
+    -- Remove from DLQ
+    redis.call('LREM', dlqReadyKey, 0, msgId)
+    redis.call('ZREM', dlqInflightKey, msgId)
+
+    -- Push to source queue ready list
+    redis.call('RPUSH', srcReadyKey, msgId)
+    table.insert(redriven, msgId)
+  end
+end
+
+return redriven
+`;
+
+// Lua script to simulate failure on an inflight message
+const SIMULATE_FAIL_LUA = `
+local inflightKey = KEYS[1]
+local dlqReadyKey = KEYS[2]
+local dlqMetaKey = KEYS[3]
+local qName = ARGV[1]
+local msgId = ARGV[2]
+local dlqName = ARGV[3]
+local maxReceive = tonumber(ARGV[4]) or 3
+local failedAt = ARGV[5]
+local errorTrace = ARGV[6]
+local nowIso = ARGV[7]
+local qType = ARGV[8] or 'standard'
+
+local msgKey = 'msg:' .. qName .. ':' .. msgId
+if redis.call('EXISTS', msgKey) == 0 then
+  return { 0, 0, 0 } -- Not found
+end
+
+-- Remove from inflight
+redis.call('ZREM', inflightKey, msgId)
+
+local newReceiveCount = redis.call('HINCRBY', msgKey, 'receiveCount', 1)
+
+if newReceiveCount > maxReceive then
+  -- Exceeded! Move to DLQ
+  local dlqExists = redis.call('EXISTS', dlqMetaKey)
+  if dlqExists == 0 then
+    redis.call('SADD', 'queues:all', dlqName)
+    redis.call('HSET', dlqMetaKey,
+      'name', dlqName,
+      'type', qType,
+      'visibilityTimeout', '30',
+      'maxReceiveCount', '3',
+      'createdAt', nowIso
+    )
+  end
+
+  local dlqMsgKey = 'msg:' .. dlqName .. ':' .. msgId
+  redis.call('RENAME', msgKey, dlqMsgKey)
+
+  local reason = 'MaxReceiveCountExceeded (Attempted ' .. newReceiveCount .. ' times)'
+  redis.call('HSET', dlqMsgKey,
+    'failedAt', failedAt,
+    'failureReason', reason,
+    'errorTrace', errorTrace,
+    'sourceQueue', qName
+  )
+
+  redis.call('RPUSH', dlqReadyKey, msgId)
+  return { 1, 1, newReceiveCount } -- { success, movedToDlq, newReceiveCount }
+else
+  -- Return back to ready list with incremented receiveCount
+  local readyKey = 'queue:' .. qName .. ':ready'
+  redis.call('LPUSH', readyKey, msgId)
+  return { 1, 0, newReceiveCount } -- { success, movedToDlq=0, newReceiveCount }
+end
+`;
+
 export class QueueService {
+  /**
+   * Helper to derive standard DLQ name
+   */
+  public static getDLQName(queueName: string): string {
+    return `${queueName}-dlq`;
+  }
+
   /**
    * Validate queue name according to SQS specifications
    */
@@ -106,15 +321,15 @@ export class QueueService {
       throw new Error('Queue name must be between 1 and 80 characters');
     }
 
-    // Allow alphanumeric characters, hyphens (-), underscores (_), and periods (.) for .fifo
-    const validNamePattern = /^[a-zA-Z0-9_-]+(\.fifo)?$/;
+    const validNamePattern = /^[a-zA-Z0-9_.-]+$/;
     if (!validNamePattern.test(trimmed)) {
       throw new Error('Queue name can only contain alphanumeric characters, hyphens, and underscores');
     }
 
     const isFifoName = trimmed.endsWith('.fifo');
 
-    if (type === 'fifo' && !isFifoName) {
+    // If it is a DLQ for a FIFO queue (e.g. orders.fifo-dlq), allow it
+    if (type === 'fifo' && !isFifoName && !trimmed.endsWith('-dlq')) {
       throw new Error('FIFO queue name must end with the .fifo suffix');
     }
 
@@ -140,6 +355,9 @@ export class QueueService {
       pipeline.hgetall(`queue:${name}:meta`);
       pipeline.llen(`queue:${name}:ready`);
       pipeline.zcard(`queue:${name}:inflight`);
+      const dlqName = `${name}-dlq`;
+      pipeline.llen(`queue:${dlqName}:ready`);
+      pipeline.zcard(`queue:${dlqName}:inflight`);
     }
 
     const results = await pipeline.exec();
@@ -148,13 +366,13 @@ export class QueueService {
     const queues: QueueWithStats[] = [];
 
     for (let i = 0; i < queueNames.length; i++) {
-      const metaIndex = i * 3;
-      const readyIndex = i * 3 + 1;
-      const inflightIndex = i * 3 + 2;
-
-      const metaRaw = results[metaIndex][1] as Record<string, string>;
-      const readyCount = (results[readyIndex][1] as number) || 0;
-      const inFlightCount = (results[inflightIndex][1] as number) || 0;
+      const baseIdx = i * 5;
+      const metaRaw = results[baseIdx][1] as Record<string, string>;
+      const readyCount = (results[baseIdx + 1][1] as number) || 0;
+      const inFlightCount = (results[baseIdx + 2][1] as number) || 0;
+      const dlqReady = (results[baseIdx + 3][1] as number) || 0;
+      const dlqInflight = (results[baseIdx + 4][1] as number) || 0;
+      const dlqCount = dlqReady + dlqInflight;
 
       const queueName = queueNames[i];
       const type: QueueType = (metaRaw?.type as QueueType) || (queueName.endsWith('.fifo') ? 'fifo' : 'standard');
@@ -172,11 +390,11 @@ export class QueueService {
           readyCount,
           inFlightCount,
           totalApproximate: readyCount + inFlightCount,
+          dlqCount,
         },
       });
     }
 
-    // Sort alphabetically by name
     return queues.sort((a, b) => a.name.localeCompare(b.name));
   }
 
@@ -189,10 +407,13 @@ export class QueueService {
       return null;
     }
 
+    const dlqName = `${name}-dlq`;
     const pipeline = redis.pipeline();
     pipeline.hgetall(`queue:${name}:meta`);
     pipeline.llen(`queue:${name}:ready`);
     pipeline.zcard(`queue:${name}:inflight`);
+    pipeline.llen(`queue:${dlqName}:ready`);
+    pipeline.zcard(`queue:${dlqName}:inflight`);
 
     const results = await pipeline.exec();
     if (!results) return null;
@@ -200,6 +421,8 @@ export class QueueService {
     const metaRaw = results[0][1] as Record<string, string>;
     const readyCount = (results[1][1] as number) || 0;
     const inFlightCount = (results[2][1] as number) || 0;
+    const dlqReady = (results[3][1] as number) || 0;
+    const dlqInflight = (results[4][1] as number) || 0;
 
     const type: QueueType = (metaRaw?.type as QueueType) || (name.endsWith('.fifo') ? 'fifo' : 'standard');
     const visibilityTimeout = Number(metaRaw?.visibilityTimeout) || 30;
@@ -216,6 +439,7 @@ export class QueueService {
         readyCount,
         inFlightCount,
         totalApproximate: readyCount + inFlightCount,
+        dlqCount: dlqReady + dlqInflight,
       },
     };
   }
@@ -227,7 +451,7 @@ export class QueueService {
     const { name, type } = this.validateQueueName(input.name, input.type);
 
     const exists = await redis.sismember('queues:all', name);
-    const visibilityTimeout = Math.max(0, Math.min(43200, Number(input.visibilityTimeout) || 30));
+    const visibilityTimeout = Math.max(1, Math.min(43200, Number(input.visibilityTimeout) || 30));
     const maxReceiveCount = Math.max(1, Math.min(1000, Number(input.maxReceiveCount) || 3));
 
     if (exists) {
@@ -291,7 +515,7 @@ export class QueueService {
     const bytes = Buffer.byteLength(bodyStr, 'utf8');
     const sizeKb = Number((bytes / 1024).toFixed(3));
 
-    let messageGroupId = input.messageGroupId?.trim();
+    const messageGroupId = input.messageGroupId?.trim();
     let messageDeduplicationId = input.messageDeduplicationId?.trim();
 
     // FIFO specific validations & deduplication window
@@ -300,7 +524,6 @@ export class QueueService {
         throw new Error('FIFO queues require a non-empty messageGroupId');
       }
 
-      // Auto-generate SHA-256 deduplication ID if not provided
       if (!messageDeduplicationId) {
         messageDeduplicationId = createHash('sha256').update(bodyStr).digest('hex');
       }
@@ -327,7 +550,6 @@ export class QueueService {
       }
 
       const messageId = nanoid();
-      // Set deduplication key with 5-minute TTL (300 seconds)
       await redis.set(dedupKey, messageId, 'EX', 300);
 
       const msgKey = `msg:${queueName}:${messageId}`;
@@ -397,7 +619,7 @@ export class QueueService {
   }
 
   /**
-   * Receive/Poll messages from queue with visibility timeout
+   * Receive/Poll messages from queue with DLQ routing on maxReceiveCount exceeded
    */
   public static async receiveMessages(
     queueName: string,
@@ -411,14 +633,17 @@ export class QueueService {
     const maxMessages = Math.min(10, Math.max(1, Number(options.maxMessages) || 1));
     const visibilityTimeout =
       options.visibilityTimeout !== undefined && !isNaN(Number(options.visibilityTimeout))
-        ? Math.max(0, Math.min(43200, Number(options.visibilityTimeout)))
+        ? Math.max(1, Math.min(43200, Number(options.visibilityTimeout)))
         : queue.visibilityTimeout;
 
     const waitTimeSeconds = Math.min(20, Math.max(0, Number(options.waitTimeSeconds) || 0));
     const readyKey = `queue:${queueName}:ready`;
     const inflightKey = `queue:${queueName}:inflight`;
+    const dlqName = this.getDLQName(queueName);
+    const dlqReadyKey = `queue:${dlqName}:ready`;
+    const dlqMetaKey = `queue:${dlqName}:meta`;
 
-    // Basic polling delay if queue is empty and waitTimeSeconds > 0
+    // Polling delay if queue is empty and waitTimeSeconds > 0
     if (waitTimeSeconds > 0) {
       const readyLen = await redis.llen(readyKey);
       if (readyLen === 0) {
@@ -435,23 +660,43 @@ export class QueueService {
     }
 
     const expireAt = Date.now() + visibilityTimeout * 1000;
+    const nowIso = new Date().toISOString();
+    const errorTrace =
+      'ProcessingError: Consumer worker failed to acknowledge within VisibilityTimeout. Maximum retry threshold reached at worker-node-primary.';
 
-    // Atomically pull messages from ready list and insert into inflight ZSET
-    const pulledIds = (await redis.eval(
+    // Execute atomic Lua script
+    const evalResult = (await redis.eval(
       RECEIVE_MESSAGES_LUA,
-      2,
+      4,
       readyKey,
       inflightKey,
+      dlqReadyKey,
+      dlqMetaKey,
       maxMessages,
       expireAt,
-      queueName
-    )) as string[];
+      queueName,
+      dlqName,
+      queue.maxReceiveCount,
+      nowIso,
+      errorTrace,
+      nowIso,
+      queue.type
+    )) as [string[], string[]];
 
-    if (!pulledIds || pulledIds.length === 0) {
+    const pulledIds = evalResult[0] || [];
+    const movedToDlq = evalResult[1] || [];
+
+    if (movedToDlq.length > 0) {
+      console.log(
+        `🚨 [DLQ Trigger] Moved ${movedToDlq.length} message(s) exceeding maxReceiveCount (${queue.maxReceiveCount}) from "${queueName}" to "${dlqName}"`
+      );
+    }
+
+    if (pulledIds.length === 0) {
       return [];
     }
 
-    // Retrieve metadata for pulled messages in pipeline
+    // Retrieve metadata for successfully delivered messages
     const pipeline = redis.pipeline();
     for (const msgId of pulledIds) {
       pipeline.hgetall(`msg:${queueName}:${msgId}`);
@@ -481,6 +726,174 @@ export class QueueService {
     }
 
     return messages;
+  }
+
+  /**
+   * Simulate a processing failure on an in-flight message
+   */
+  public static async simulateFailure(
+    queueName: string,
+    messageId: string
+  ): Promise<{ success: boolean; movedToDlq: boolean; currentReceiveCount: number }> {
+    const queue = await this.getQueue(queueName);
+    if (!queue) {
+      throw new Error(`Queue not found: ${queueName}`);
+    }
+
+    const inflightKey = `queue:${queueName}:inflight`;
+    const dlqName = this.getDLQName(queueName);
+    const dlqReadyKey = `queue:${dlqName}:ready`;
+    const dlqMetaKey = `queue:${dlqName}:meta`;
+    const nowIso = new Date().toISOString();
+    const errorTrace =
+      'ProcessingError: Consumer worker failed to acknowledge within VisibilityTimeout. Maximum retry threshold reached at worker-node-primary.';
+
+    const res = (await redis.eval(
+      SIMULATE_FAIL_LUA,
+      3,
+      inflightKey,
+      dlqReadyKey,
+      dlqMetaKey,
+      queueName,
+      messageId,
+      dlqName,
+      queue.maxReceiveCount,
+      nowIso,
+      errorTrace,
+      nowIso,
+      queue.type
+    )) as [number, number, number];
+
+    const success = res[0] === 1;
+    const movedToDlq = res[1] === 1;
+    const currentReceiveCount = res[2];
+
+    return {
+      success,
+      movedToDlq,
+      currentReceiveCount,
+    };
+  }
+
+  /**
+   * Inspect DLQ: list all messages in DLQ with error traces and metadata
+   */
+  public static async inspectDLQ(dlqName: string): Promise<DLQMessageMetadata[]> {
+    const readyKey = `queue:${dlqName}:ready`;
+    const inflightKey = `queue:${dlqName}:inflight`;
+
+    const readyIds = await redis.lrange(readyKey, 0, -1);
+    const inflightIds = await redis.zrange(inflightKey, 0, -1);
+    const allIds = Array.from(new Set([...readyIds, ...inflightIds]));
+
+    if (allIds.length === 0) {
+      return [];
+    }
+
+    const pipeline = redis.pipeline();
+    for (const msgId of allIds) {
+      pipeline.hgetall(`msg:${dlqName}:${msgId}`);
+    }
+
+    const results = await pipeline.exec();
+    if (!results) return [];
+
+    const messages: DLQMessageMetadata[] = [];
+
+    for (let i = 0; i < allIds.length; i++) {
+      const msgId = allIds[i];
+      const raw = results[i][1] as Record<string, string>;
+
+      if (raw && raw.id) {
+        messages.push({
+          id: msgId,
+          body: raw.body,
+          sizeKb: Number(raw.sizeKb) || 0,
+          enqueueTime: raw.enqueueTime,
+          receiveCount: Number(raw.receiveCount) || 0,
+          messageGroupId: raw.messageGroupId,
+          messageDeduplicationId: raw.messageDeduplicationId,
+          failedAt: raw.failedAt || raw.enqueueTime || new Date().toISOString(),
+          failureReason: raw.failureReason || 'MaxReceiveCountExceeded',
+          errorTrace:
+            raw.errorTrace ||
+            'ProcessingError: Consumer worker failed to acknowledge within VisibilityTimeout. Maximum retry threshold reached at worker-node-primary.',
+          sourceQueue: raw.sourceQueue || dlqName.replace(/-dlq$/, ''),
+        });
+      }
+    }
+
+    return messages;
+  }
+
+  /**
+   * Edit/Mutate message payload directly in the DLQ before re-driving
+   */
+  public static async updateDLQMessage(
+    dlqName: string,
+    messageId: string,
+    newBody: string | Record<string, unknown>
+  ): Promise<DLQMessageMetadata> {
+    const dlqMsgKey = `msg:${dlqName}:${messageId}`;
+    const exists = await redis.exists(dlqMsgKey);
+    if (!exists) {
+      throw new Error(`Message "${messageId}" not found in DLQ "${dlqName}"`);
+    }
+
+    const bodyStr = typeof newBody === 'string' ? newBody : JSON.stringify(newBody, null, 2);
+    const bytes = Buffer.byteLength(bodyStr, 'utf8');
+    const sizeKb = Number((bytes / 1024).toFixed(3));
+
+    await redis.hset(dlqMsgKey, {
+      body: bodyStr,
+      sizeKb: sizeKb.toString(),
+    });
+
+    const updated = await redis.hgetall(dlqMsgKey);
+
+    return {
+      id: messageId,
+      body: bodyStr,
+      sizeKb,
+      enqueueTime: updated.enqueueTime,
+      receiveCount: Number(updated.receiveCount) || 0,
+      messageGroupId: updated.messageGroupId,
+      messageDeduplicationId: updated.messageDeduplicationId,
+      failedAt: updated.failedAt,
+      failureReason: updated.failureReason,
+      errorTrace: updated.errorTrace,
+      sourceQueue: updated.sourceQueue || dlqName.replace(/-dlq$/, ''),
+    };
+  }
+
+  /**
+   * Redrive messages from DLQ back to their source queue
+   */
+  public static async redriveMessages(dlqName: string, messageIds?: string[]): Promise<RedriveResponse> {
+    const dlqReadyKey = `queue:${dlqName}:ready`;
+    const dlqInflightKey = `queue:${dlqName}:inflight`;
+
+    const args: (string | number)[] = [dlqName];
+    if (messageIds && messageIds.length > 0) {
+      args.push(...messageIds);
+    }
+
+    const redrivenIds = (await redis.eval(
+      REDRIVE_LUA,
+      2,
+      dlqReadyKey,
+      dlqInflightKey,
+      ...args
+    )) as string[];
+
+    const sourceQueue = dlqName.replace(/-dlq$/, '');
+
+    return {
+      success: true,
+      redrivenCount: redrivenIds.length,
+      messageIds: redrivenIds,
+      targetQueue: sourceQueue,
+    };
   }
 
   /**

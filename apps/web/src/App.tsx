@@ -1,294 +1,387 @@
 import { useState, useEffect, useCallback } from 'react';
 import { 
-  Server, 
-  Database, 
-  Activity, 
-  RefreshCw, 
-  Layers, 
-  Terminal, 
-  CheckCircle2, 
-  XCircle,
-  Clock,
-  ShieldCheck
+  Send, 
+  ShieldAlert
 } from 'lucide-react';
-
-interface HealthData {
-  status: 'healthy' | 'unhealthy';
-  service: string;
-  timestamp: string;
-  redis: string;
-  uptime: number;
-  error?: string;
-}
+import type { Queue, DLQMessage, HealthStatus, CreateQueueData } from './types';
+import { ApiClient } from './api/client';
+import { Header } from './components/Header';
+import { MetricsCards } from './components/MetricsCards';
+import { CreateQueueModal } from './components/CreateQueueModal';
+import { MessageSimulatorTab } from './components/MessageSimulatorTab';
+import { DLQInspectorTab } from './components/DLQInspectorTab';
+import { InspectErrorModal } from './components/InspectErrorModal';
+import { EditPayloadModal } from './components/EditPayloadModal';
 
 export function App() {
-  const [health, setHealth] = useState<HealthData | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-  const [lastChecked, setLastChecked] = useState<Date>(new Date());
+  const [queues, setQueues] = useState<Queue[]>([]);
+  const [selectedQueue, setSelectedQueue] = useState<Queue | null>(null);
+  const [activeTab, setActiveTab] = useState<'simulator' | 'dlq'>('simulator');
+  const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const checkHealth = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  // DLQ Messages State
+  const [dlqMessages, setDlqMessages] = useState<DLQMessage[]>([]);
+  const [isLoadingDLQ, setIsLoadingDLQ] = useState(false);
+
+  // Modals
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [inspectingMessage, setInspectingMessage] = useState<DLQMessage | null>(null);
+  const [editingMessage, setEditingMessage] = useState<DLQMessage | null>(null);
+
+  // Toast / Status Notification
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  const showToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  // Fetch Health
+  const loadHealth = useCallback(async () => {
     try {
-      // Attempt proxy first (/api/health), fallback to direct port 3001
-      const res = await fetch('/api/health').catch(() => fetch('http://localhost:3001/health'));
-      const data = await res.json();
+      const data = await ApiClient.getHealth();
       setHealth(data);
-      if (!res.ok) {
-        setError(data.error || `HTTP ${res.status} returned from health endpoint`);
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to connect to backend';
-      setError(msg);
+    } catch {
       setHealth(null);
-    } finally {
-      setLoading(false);
-      setLastChecked(new Date());
     }
   }, []);
 
-  useEffect(() => {
-    checkHealth();
-    const interval = setInterval(checkHealth, 10000);
-    return () => clearInterval(interval);
-  }, [checkHealth]);
+  // Fetch Queues
+  const loadQueues = useCallback(async (selectQueueName?: string) => {
+    try {
+      const queueList = await ApiClient.listQueues();
+      setQueues(queueList);
 
-  const isHealthy = health?.status === 'healthy';
+      setSelectedQueue((currentSelected) => {
+        if (selectQueueName) {
+          const match = queueList.find((q) => q.name === selectQueueName);
+          if (match) return match;
+        }
+        if (currentSelected) {
+          const updated = queueList.find((q) => q.name === currentSelected.name);
+          if (updated) return updated;
+        }
+        const nonDlq = queueList.find((q) => !q.name.endsWith('-dlq'));
+        return nonDlq || queueList[0] || null;
+      });
+    } catch (err: unknown) {
+      console.error('Failed to load queues:', err);
+    }
+  }, []);
+
+  // Fetch DLQ Messages
+  const loadDLQMessages = useCallback(async (targetQueue?: Queue | null) => {
+    const q = targetQueue || selectedQueue;
+    if (!q) {
+      setDlqMessages([]);
+      return;
+    }
+
+    const dlqName = `${q.name}-dlq`;
+    setIsLoadingDLQ(true);
+    try {
+      const msgs = await ApiClient.getDLQInspector(dlqName);
+      setDlqMessages(msgs);
+    } catch {
+      setDlqMessages([]);
+    } finally {
+      setIsLoadingDLQ(false);
+    }
+  }, [selectedQueue]);
+
+  // Initial Load & Auto-Refresh Interval
+  useEffect(() => {
+    loadHealth();
+    loadQueues();
+
+    const interval = setInterval(() => {
+      loadHealth();
+      loadQueues();
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [loadHealth, loadQueues]);
+
+  // When selected queue changes, fetch its DLQ messages
+  useEffect(() => {
+    if (selectedQueue) {
+      loadDLQMessages(selectedQueue);
+    }
+  }, [selectedQueue, loadDLQMessages]);
+
+  const handleManualRefresh = async () => {
+    setIsRefreshing(true);
+    await Promise.all([loadHealth(), loadQueues(), loadDLQMessages(selectedQueue)]);
+    setIsRefreshing(false);
+    showToast('Queue metrics refreshed', 'info');
+  };
+
+  // Create Queue Handler
+  const handleCreateQueue = async (data: CreateQueueData) => {
+    const result = await ApiClient.createQueue(data);
+    await loadQueues(result.queue.name);
+    showToast(`Queue "${result.queue.name}" created successfully!`, 'success');
+  };
+
+  // Send Message Handler
+  const handleSendMessage = async (body: unknown, groupId?: string, dedupId?: string) => {
+    if (!selectedQueue) throw new Error('No queue selected');
+    const res = await ApiClient.sendMessage(selectedQueue.name, body, groupId, dedupId);
+    await loadQueues(selectedQueue.name);
+    if (res.deduplicated) {
+      showToast(`FIFO Deduplication Window Active: Returning existing message ID ${res.message.id}`, 'info');
+    } else {
+      showToast(`Message ${res.message.id} published to ${selectedQueue.name}!`, 'success');
+    }
+  };
+
+  // Poll Messages Handler
+  const handlePollMessages = async (options: {
+    maxMessages: number;
+    visibilityTimeout: number;
+    waitTimeSeconds: number;
+  }) => {
+    if (!selectedQueue) throw new Error('No queue selected');
+    const msgs = await ApiClient.receiveMessages(selectedQueue.name, options);
+    await loadQueues(selectedQueue.name);
+    await loadDLQMessages(selectedQueue);
+    return msgs;
+  };
+
+  // Acknowledge Message Handler
+  const handleAcknowledgeMessage = async (messageId: string) => {
+    if (!selectedQueue) return;
+    await ApiClient.ackMessage(selectedQueue.name, messageId);
+    await loadQueues(selectedQueue.name);
+    showToast(`Message ${messageId} acknowledged and removed from storage.`, 'success');
+  };
+
+  // Simulate Failure Handler
+  const handleSimulateFailure = async (messageId: string) => {
+    if (!selectedQueue) return;
+    const res = await ApiClient.simulateFailure(selectedQueue.name, messageId);
+    await loadQueues(selectedQueue.name);
+    await loadDLQMessages(selectedQueue);
+    if (res.movedToDlq) {
+      showToast(
+        `Threshold exceeded (${selectedQueue.maxReceiveCount} attempts)! Message ${messageId} routed to DLQ.`,
+        'error'
+      );
+    } else {
+      showToast(
+        `Failure simulated: Message retry count incremented to ${res.receiveCount}. Returned to ready queue.`,
+        'info'
+      );
+    }
+  };
+
+  // Purge Queue Handler
+  const handlePurgeQueue = async () => {
+    if (!selectedQueue) return;
+    const res = await ApiClient.purgeQueue(selectedQueue.name);
+    await loadQueues(selectedQueue.name);
+    showToast(`Queue "${selectedQueue.name}" purged (${res.totalPurged} messages removed).`, 'info');
+  };
+
+  // DLQ: Bulk Redrive Handler
+  const handleBulkRedrive = async () => {
+    if (!selectedQueue) return;
+    const dlqName = `${selectedQueue.name}-dlq`;
+    const res = await ApiClient.redriveDLQ(dlqName);
+    await loadQueues(selectedQueue.name);
+    await loadDLQMessages(selectedQueue);
+    showToast(
+      `Re-drive complete! ${res.redrivenCount} message(s) returned to "${res.targetQueue}" with reset retry counts.`,
+      'success'
+    );
+  };
+
+  // DLQ: Single Message Redrive Handler
+  const handleSingleRedrive = async (messageId: string) => {
+    if (!selectedQueue) return;
+    const dlqName = `${selectedQueue.name}-dlq`;
+    const res = await ApiClient.redriveDLQ(dlqName, [messageId]);
+    await loadQueues(selectedQueue.name);
+    await loadDLQMessages(selectedQueue);
+    showToast(`Message ${messageId} re-driven to "${res.targetQueue}"!`, 'success');
+  };
+
+  // DLQ: Save Edited Payload Handler
+  const handleSaveEditedPayload = async (messageId: string, newBody: string) => {
+    if (!selectedQueue) return;
+    const dlqName = `${selectedQueue.name}-dlq`;
+    let parsedBody: unknown;
+    try {
+      parsedBody = JSON.parse(newBody);
+    } catch {
+      parsedBody = newBody;
+    }
+    await ApiClient.updateDLQMessage(dlqName, messageId, parsedBody);
+    await loadDLQMessages(selectedQueue);
+    showToast(`Message ${messageId} payload updated in DLQ.`, 'success');
+  };
+
+  const dlqCount = selectedQueue?.stats.dlqCount ?? dlqMessages.length;
 
   return (
-    <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '2.5rem 1.5rem' }}>
+    <div className="min-h-screen bg-black text-zinc-100 flex flex-col font-sans antialiased selection:bg-zinc-800 selection:text-white w-full">
+      {/* Toast Notification */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-50 animate-in fade-in slide-in-from-bottom-2 duration-150">
+          <div
+            className={`flex items-center gap-3 px-5 py-3 rounded-md shadow-2xl text-xs font-mono ${
+              toast.type === 'error'
+                ? 'bg-red-950/60 border border-red-900/80 text-red-200'
+                : toast.type === 'success'
+                ? 'bg-zinc-900 border border-emerald-900/50 text-zinc-100'
+                : 'bg-zinc-900 border border-zinc-800 text-zinc-100'
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${
+                toast.type === 'success'
+                  ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]'
+                  : toast.type === 'error'
+                  ? 'bg-red-400 shadow-[0_0_8px_rgba(248,113,113,0.8)]'
+                  : 'bg-zinc-400'
+              }`}
+            />
+            <span className="font-sans text-sm font-medium">{toast.message}</span>
+          </div>
+        </div>
+      )}
+
       {/* Top Header */}
-      <header style={{ 
-        display: 'flex', 
-        justifyContent: 'space-between', 
-        alignItems: 'center', 
-        marginBottom: '3rem',
-        paddingBottom: '1.5rem',
-        borderBottom: '1px solid var(--border-subtle)'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <div style={{
-            width: '44px',
-            height: '44px',
-            borderRadius: '10px',
-            background: 'linear-gradient(135deg, #0284c7, #38bdf8)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            boxShadow: '0 0 20px rgba(56, 189, 248, 0.4)'
-          }}>
-            <Layers color="#ffffff" size={24} />
-          </div>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-              <h1 style={{ fontSize: '1.5rem', fontWeight: 800, letterSpacing: '-0.02em' }}>INSPECTR</h1>
-              <span className="badge badge-info">v0.1.0 (Stage 1)</span>
-            </div>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
-              Amazon SQS Simulation Platform • Visual DLQ Inspector & Replay Engine
-            </p>
-          </div>
-        </div>
+      <Header
+        queues={queues}
+        selectedQueue={selectedQueue}
+        onSelectQueue={(q) => setSelectedQueue(q)}
+        onOpenCreateModal={() => setIsCreateModalOpen(true)}
+        onRefresh={handleManualRefresh}
+        isRefreshing={isRefreshing}
+        health={health}
+      />
 
-        <button 
-          onClick={checkHealth}
-          disabled={loading}
-          style={{
-            background: 'var(--bg-secondary)',
-            color: 'var(--text-primary)',
-            border: '1px solid var(--border-subtle)',
-            borderRadius: '8px',
-            padding: '0.625rem 1.25rem',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.5rem',
-            cursor: loading ? 'not-allowed' : 'pointer',
-            fontSize: '0.875rem',
-            fontWeight: 600,
-            transition: 'all 0.2s ease',
-          }}
-        >
-          <RefreshCw size={16} className={loading ? 'animate-spin' : ''} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
-          <span>Refresh Health</span>
-        </button>
-      </header>
+      {/* Main Container - Full Width across the entire page with generous horizontal & vertical spacing */}
+      <main className="flex-1 w-full px-8 sm:px-16 lg:px-24 xl:px-32 2xl:px-40 py-14 lg:py-20 flex flex-col">
+        {/* Metrics Row */}
+        <MetricsCards
+          queue={selectedQueue}
+          onOpenDLQTab={() => setActiveTab('dlq')}
+        />
 
-      {/* Main Status Grid */}
-      <section style={{ marginBottom: '2.5rem' }}>
-        <h2 style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <Activity size={18} color="var(--accent-cyan)" />
-          System Health & Environment Status
-        </h2>
+        {/* Tab Navigation Controls */}
+        <div className="flex items-center justify-between border-b border-zinc-800 mb-14 sm:mb-16 w-full gap-4">
+          <div className="flex items-center gap-6 sm:gap-8 flex-wrap">
+            {/* Tab 1: Message Simulator */}
+            <button
+              onClick={() => setActiveTab('simulator')}
+              className={`flex items-center gap-3 py-4.5 px-5 text-sm font-semibold tracking-tight border-b-2 -mb-px transition cursor-pointer shrink-0 ${
+                activeTab === 'simulator'
+                  ? 'border-white text-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              <Send className="w-4 h-4 shrink-0" />
+              <span>Message Simulator</span>
+            </button>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1.25rem' }}>
-          {/* Backend API Card */}
-          <div className="glass-panel" style={{ padding: '1.5rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                <div style={{ padding: '0.5rem', borderRadius: '8px', background: 'rgba(56, 189, 248, 0.1)' }}>
-                  <Server size={20} color="var(--accent-cyan)" />
-                </div>
-                <div>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 600 }}>Backend API</h3>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Hono / Bun Server (:3001)</span>
-                </div>
-              </div>
-              <span className={`badge ${health ? (isHealthy ? 'badge-healthy' : 'badge-unhealthy') : 'badge-checking'}`}>
-                <span className="pulse-dot" style={{ backgroundColor: isHealthy ? 'var(--accent-emerald)' : 'var(--accent-rose)' }}></span>
-                {health ? health.status : 'Connecting...'}
-              </span>
-            </div>
-            
-            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Service:</span>
-                <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>{health?.service || 'inspectr-api'}</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Process Uptime:</span>
-                <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
-                  {health?.uptime !== undefined ? `${health.uptime}s` : '—'}
+            {/* Tab 2: DLQ Inspector & Replay */}
+            <button
+              onClick={() => setActiveTab('dlq')}
+              className={`flex items-center gap-3 py-4.5 px-5 text-sm font-semibold tracking-tight border-b-2 -mb-px transition cursor-pointer shrink-0 ${
+                activeTab === 'dlq'
+                  ? 'border-white text-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              <ShieldAlert className={`w-4 h-4 shrink-0 ${dlqCount > 0 ? 'text-red-400' : ''}`} />
+              <span>DLQ Inspector & Replay</span>
+              {dlqCount > 0 && (
+                <span className="ml-2.5 px-2.5 py-0.5 rounded border border-red-900/60 bg-red-950/40 text-red-400 text-xs font-mono font-bold shrink-0">
+                  {dlqCount}
                 </span>
-              </div>
-            </div>
+              )}
+            </button>
           </div>
 
-          {/* Redis Cluster Card */}
-          <div className="glass-panel" style={{ padding: '1.5rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                <div style={{ padding: '0.5rem', borderRadius: '8px', background: 'rgba(239, 68, 68, 0.1)' }}>
-                  <Database size={20} color="#f87171" />
-                </div>
-                <div>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 600 }}>Redis Storage Engine</h3>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Podman Container (:6379)</span>
-                </div>
-              </div>
-              <span className={`badge ${health?.redis === 'connected' ? 'badge-healthy' : 'badge-unhealthy'}`}>
-                {health?.redis === 'connected' ? <CheckCircle2 size={13} /> : <XCircle size={13} />}
-                {health?.redis || 'disconnected'}
-              </span>
-            </div>
-
-            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Ping Check:</span>
-                <span style={{ color: health?.redis === 'connected' ? 'var(--accent-emerald)' : 'var(--accent-rose)', fontWeight: 600 }}>
-                  {health?.redis === 'connected' ? 'PONG (active)' : 'Unreachable'}
-                </span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Client Driver:</span>
-                <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>ioredis singleton</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Environment Card */}
-          <div className="glass-panel" style={{ padding: '1.5rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                <div style={{ padding: '0.5rem', borderRadius: '8px', background: 'rgba(168, 85, 247, 0.1)' }}>
-                  <Terminal size={20} color="var(--accent-purple)" />
-                </div>
-                <div>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 600 }}>Runtime Environment</h3>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Fedora Linux • Bun Monorepo</span>
-                </div>
-              </div>
-              <span className="badge badge-info">
-                <ShieldCheck size={13} />
-                Verified
-              </span>
-            </div>
-
-            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Workspaces:</span>
-                <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>@inspectr/server, @inspectr/web</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Last Polled:</span>
-                <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
-                  {lastChecked.toLocaleTimeString()}
-                </span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {error && (
-          <div style={{ 
-            marginTop: '1.25rem', 
-            padding: '1rem 1.25rem', 
-            background: 'rgba(239, 68, 68, 0.12)', 
-            border: '1px solid rgba(239, 68, 68, 0.3)',
-            borderRadius: '8px',
-            color: '#fca5a5',
-            fontSize: '0.875rem',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.75rem'
-          }}>
-            <XCircle size={18} />
-            <span>Connection Issue: {error}</span>
-          </div>
-        )}
-      </section>
-
-      {/* Live Health Payload Viewer */}
-      <section style={{ marginBottom: '3rem' }}>
-        <div className="glass-panel" style={{ padding: '1.5rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <Clock size={16} color="var(--accent-cyan)" />
-              <h3 style={{ fontSize: '0.95rem', fontWeight: 600 }}>Raw Health Endpoint Response (GET /health)</h3>
-            </div>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-              HTTP {isHealthy ? '200 OK' : '503 Service Unavailable'}
+          <div className="text-sm text-zinc-400 hidden sm:flex items-center gap-2.5 font-mono shrink-0">
+            <span>target queue:</span>
+            <span className="px-3 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-white font-medium text-xs shadow-sm">
+              {selectedQueue?.name || 'none'}
             </span>
           </div>
-          <pre style={{
-            background: 'rgba(0, 0, 0, 0.4)',
-            padding: '1rem 1.25rem',
-            borderRadius: '8px',
-            border: '1px solid rgba(255, 255, 255, 0.05)',
-            fontSize: '0.85rem',
-            color: '#38bdf8',
-            overflowX: 'auto',
-            lineHeight: 1.6
-          }}>
-            {health ? JSON.stringify(health, null, 2) : '/* Waiting for server response... */'}
-          </pre>
         </div>
-      </section>
 
-      {/* Platform Roadmap / Modules Preview */}
-      <section>
-        <h2 style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '1rem' }}>Inspectr Core Modules</h2>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem' }}>
-          <div className="glass-panel" style={{ padding: '1.25rem' }}>
-            <h4 style={{ fontWeight: 600, color: 'var(--accent-cyan)', marginBottom: '0.35rem' }}>SQS Message Broker</h4>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-              Standard and FIFO queues with visibility timeouts, delay queues, and in-flight message state machine.
-            </p>
+        {/* Tab 1 Content: Message Simulator */}
+        {activeTab === 'simulator' && (
+          <MessageSimulatorTab
+            queue={selectedQueue}
+            onSendMessage={handleSendMessage}
+            onPollMessages={handlePollMessages}
+            onAcknowledgeMessage={handleAcknowledgeMessage}
+            onSimulateFailure={handleSimulateFailure}
+            onPurgeQueue={handlePurgeQueue}
+          />
+        )}
+
+        {/* Tab 2 Content: DLQ Inspector & Replay */}
+        {activeTab === 'dlq' && (
+          <DLQInspectorTab
+            queue={selectedQueue}
+            dlqMessages={dlqMessages}
+            isLoading={isLoadingDLQ}
+            onRefreshDLQ={() => loadDLQMessages(selectedQueue)}
+            onInspectError={(msg) => setInspectingMessage(msg)}
+            onEditPayload={(msg) => setEditingMessage(msg)}
+            onRedriveBulk={handleBulkRedrive}
+            onRedriveSingle={handleSingleRedrive}
+          />
+        )}
+      </main>
+
+      {/* Footer - Full Width with generous padding */}
+      <footer className="border-t border-zinc-900 bg-black py-10 text-xs text-zinc-500 mt-auto w-full">
+        <div className="w-full px-8 sm:px-16 lg:px-24 xl:px-32 2xl:px-40 flex flex-col sm:flex-row items-center justify-between gap-4 font-mono text-xs">
+          <div className="flex items-center gap-3">
+            <span className="font-bold text-zinc-300 text-sm">inspectr</span>
+            <span className="text-zinc-700">•</span>
+            <span className="text-zinc-400">SQS Distributed Queue Engine & Visual DLQ Console</span>
           </div>
-          <div className="glass-panel" style={{ padding: '1.25rem' }}>
-            <h4 style={{ fontWeight: 600, color: '#f87171', marginBottom: '0.35rem' }}>Visual DLQ Inspector</h4>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-              Deep message payload inspection, failure stack trace analysis, and redrive policy tracking.
-            </p>
-          </div>
-          <div className="glass-panel" style={{ padding: '1.25rem' }}>
-            <h4 style={{ fontWeight: 600, color: '#a78bfa', marginBottom: '0.35rem' }}>Replay Engine</h4>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-              Selective and batch replay into source or destination queues with header mutations and dry-run testing.
-            </p>
+          <div className="flex items-center gap-3 text-zinc-500">
+            <span>api: :3001</span>
+            <span className="text-zinc-800">•</span>
+            <span>redis: :6379</span>
           </div>
         </div>
-      </section>
+      </footer>
+
+      {/* Create Queue Modal */}
+      <CreateQueueModal
+        isOpen={isCreateModalOpen}
+        onClose={() => setIsCreateModalOpen(false)}
+        onSubmit={handleCreateQueue}
+      />
+
+      {/* Inspect Error Modal */}
+      <InspectErrorModal
+        isOpen={!!inspectingMessage}
+        message={inspectingMessage}
+        onClose={() => setInspectingMessage(null)}
+        onOpenEditPayload={(msg) => setEditingMessage(msg)}
+        onRedriveSingle={handleSingleRedrive}
+      />
+
+      {/* Edit Payload Modal */}
+      <EditPayloadModal
+        isOpen={!!editingMessage}
+        message={editingMessage}
+        onClose={() => setEditingMessage(null)}
+        onSave={handleSaveEditedPayload}
+      />
     </div>
   );
 }
+
+export default App;

@@ -12,9 +12,14 @@ describe('Inspectr Core SQS Queue Engine', () => {
   const stdQueueName = 'test-standard-orders';
   const fifoQueueName = 'test-payments.fifo';
 
-  beforeAll(async () => {
-    // Clean up test keys
-    const testQueues = [stdQueueName, fifoQueueName, 'temp-purge-queue'];
+  const cleanupTestKeys = async () => {
+    const testQueues = [
+      stdQueueName,
+      fifoQueueName,
+      'temp-purge-queue',
+      'test-dlq-trigger',
+      'test-dlq-trigger-dlq',
+    ];
     for (const q of testQueues) {
       await redis.srem('queues:all', q);
       await redis.del(`queue:${q}:meta`);
@@ -25,20 +30,22 @@ describe('Inspectr Core SQS Queue Engine', () => {
     if (dedupKeys.length > 0) {
       await redis.del(...dedupKeys);
     }
+    const msgKeys = await redis.keys('msg:test-*');
+    if (msgKeys.length > 0) {
+      await redis.del(...msgKeys);
+    }
+    const tempKeys = await redis.keys('msg:temp-*');
+    if (tempKeys.length > 0) {
+      await redis.del(...tempKeys);
+    }
+  };
+
+  beforeAll(async () => {
+    await cleanupTestKeys();
   });
 
   afterAll(async () => {
-    const testQueues = [stdQueueName, fifoQueueName, 'temp-purge-queue'];
-    for (const q of testQueues) {
-      await redis.srem('queues:all', q);
-      await redis.del(`queue:${q}:meta`);
-      await redis.del(`queue:${q}:ready`);
-      await redis.del(`queue:${q}:inflight`);
-    }
-    const dedupKeys = await redis.keys('dedup:*');
-    if (dedupKeys.length > 0) {
-      await redis.del(...dedupKeys);
-    }
+    await cleanupTestKeys();
   });
 
   describe('1. Queue Creation & Validation', () => {
@@ -194,6 +201,37 @@ describe('Inspectr Core SQS Queue Engine', () => {
       const readyLen = await redis.llen(`queue:${fifoQueueName}:ready`);
       expect(readyLen).toBe(1);
     });
+
+    it('should maintain FIFO delivery order per messageGroupId without concurrent delivery of same group', async () => {
+      const groupQueue = 'test-group-order.fifo';
+      await QueueService.createQueue({ name: groupQueue, visibilityTimeout: 30 });
+
+      // Send 3 messages: A1, A2, B1
+      const m1 = await QueueService.sendMessage(groupQueue, { body: 'msg-A1', messageGroupId: 'group-A' });
+      const m2 = await QueueService.sendMessage(groupQueue, { body: 'msg-A2', messageGroupId: 'group-A' });
+      const m3 = await QueueService.sendMessage(groupQueue, { body: 'msg-B1', messageGroupId: 'group-B' });
+
+      // Poll up to 3 messages: Should deliver A1 and B1, while deferring A2
+      const poll1 = await QueueService.receiveMessages(groupQueue, { maxMessages: 3 });
+      expect(poll1.length).toBe(2);
+      expect(poll1.map((m) => m.id)).toEqual([m1.message.id, m3.message.id]);
+
+      // A2 is still in the ready queue, waiting for group-A to be unlocked
+      expect(await redis.llen(`queue:${groupQueue}:ready`)).toBe(1);
+
+      // Now acknowledge A1
+      await QueueService.ackMessage(groupQueue, m1.message.id);
+
+      // Poll again: A2 can now be delivered!
+      const poll2 = await QueueService.receiveMessages(groupQueue, { maxMessages: 1 });
+      expect(poll2.length).toBe(1);
+      expect(poll2[0].id).toBe(m2.message.id);
+
+      // Clean up
+      await QueueService.purgeQueue(groupQueue);
+      await redis.srem('queues:all', groupQueue);
+      await redis.del(`queue:${groupQueue}:meta`);
+    });
   });
 
   describe('3. Receive Messages & In-Flight Transition', () => {
@@ -302,6 +340,112 @@ describe('Inspectr Core SQS Queue Engine', () => {
       // Both should be 0
       expect(await redis.llen('queue:temp-purge-queue:ready')).toBe(0);
       expect(await redis.zcard('queue:temp-purge-queue:inflight')).toBe(0);
+    });
+  });
+
+  describe('7. DLQ Engine & Inspection', () => {
+    const dlqSourceQueue = 'test-dlq-trigger';
+    const dlqName = 'test-dlq-trigger-dlq';
+
+    it('should automatically route message to DLQ when receiveCount > maxReceiveCount', async () => {
+      // Create queue with maxReceiveCount = 2
+      await QueueService.createQueue({
+        name: dlqSourceQueue,
+        maxReceiveCount: 2,
+        visibilityTimeout: 1,
+      });
+
+      // Send a message
+      const sendRes = await QueueService.sendMessage(dlqSourceQueue, { body: { errorSim: true, value: 42 } });
+      const msgId = sendRes.message.id;
+
+      // 1st receive: receiveCount becomes 1 (<= 2) -> delivered
+      const r1 = await QueueService.receiveMessages(dlqSourceQueue, { maxMessages: 1, visibilityTimeout: 1 });
+      expect(r1.length).toBe(1);
+      expect(r1[0].receiveCount).toBe(1);
+
+      // Sweep back to ready
+      await new Promise((r) => setTimeout(r, 1100));
+      await runSweepCycle();
+
+      // 2nd receive: receiveCount becomes 2 (<= 2) -> delivered
+      const r2 = await QueueService.receiveMessages(dlqSourceQueue, { maxMessages: 1, visibilityTimeout: 1 });
+      expect(r2.length).toBe(1);
+      expect(r2[0].receiveCount).toBe(2);
+
+      // Sweep back to ready
+      await new Promise((r) => setTimeout(r, 1100));
+      await runSweepCycle();
+
+      // 3rd receive: receiveCount becomes 3 (> maxReceiveCount 2) -> NOT delivered, moved to DLQ!
+      const r3 = await QueueService.receiveMessages(dlqSourceQueue, { maxMessages: 1 });
+      expect(r3.length).toBe(0); // NOT returned to consumer
+
+      // Ready queue in source should be empty
+      expect(await redis.llen(`queue:${dlqSourceQueue}:ready`)).toBe(0);
+
+      // DLQ should now have this message in ready queue
+      const dlqReadyLen = await redis.llen(`queue:${dlqName}:ready`);
+      expect(dlqReadyLen).toBe(1);
+    });
+
+    it('should list messages with full error traces via GET /api/queues/:dlqName/inspector', async () => {
+      const res = await app.request(`/api/queues/${dlqName}/inspector`);
+      expect(res.status).toBe(200);
+      const dlqMsgs = await res.json();
+      expect(dlqMsgs.length).toBe(1);
+
+      const msg = dlqMsgs[0];
+      expect(msg.failedAt).toBeDefined();
+      expect(msg.failureReason).toContain('MaxReceiveCountExceeded');
+      expect(msg.errorTrace).toContain('ProcessingError');
+      expect(msg.sourceQueue).toBe(dlqSourceQueue);
+    });
+
+    it('should mutate message payload via PUT /api/queues/:dlqName/messages/:messageId', async () => {
+      const inspectRes = await app.request(`/api/queues/${dlqName}/inspector`);
+      const dlqMsgs = await inspectRes.json();
+      const msgId = dlqMsgs[0].id;
+
+      const updatedPayload = { errorSim: false, fixed: true, value: 100 };
+      const putRes = await app.request(`/api/queues/${dlqName}/messages/${msgId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: updatedPayload }),
+      });
+
+      expect(putRes.status).toBe(200);
+      const data = await putRes.json();
+      expect(data.success).toBe(true);
+      expect(data.message.body).toContain('"fixed": true');
+
+      // Verify in inspector
+      const inspectAfter = await app.request(`/api/queues/${dlqName}/inspector`);
+      const afterMsgs = await inspectAfter.json();
+      expect(afterMsgs[0].body).toContain('"fixed": true');
+    });
+
+    it('should redrive messages back to source queue and reset receiveCount via POST /api/queues/:dlqName/redrive', async () => {
+      const redriveRes = await app.request(`/api/queues/${dlqName}/redrive`, {
+        method: 'POST',
+      });
+
+      expect(redriveRes.status).toBe(200);
+      const data = await redriveRes.json();
+      expect(data.success).toBe(true);
+      expect(data.redrivenCount).toBe(1);
+
+      // DLQ should now be empty
+      expect(await redis.llen(`queue:${dlqName}:ready`)).toBe(0);
+
+      // Source queue should now have the message back in ready
+      expect(await redis.llen(`queue:${dlqSourceQueue}:ready`)).toBe(1);
+
+      // Polling source queue should now receive the fixed message with receiveCount reset
+      const pollRes = await QueueService.receiveMessages(dlqSourceQueue, { maxMessages: 1 });
+      expect(pollRes.length).toBe(1);
+      expect(pollRes[0].receiveCount).toBe(1);
+      expect(pollRes[0].body).toContain('"fixed": true');
     });
   });
 });

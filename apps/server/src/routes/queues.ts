@@ -202,4 +202,111 @@ queuesRoute.post('/:name/purge', async (c: Context) => {
   }
 });
 
+/**
+ * GET /api/queues/:dlqName/inspector
+ * List all messages in DLQ with error traces and metadata
+ */
+queuesRoute.get('/:dlqName/inspector', async (c: Context) => {
+  try {
+    const dlqName = c.req.param('dlqName');
+    if (!dlqName) {
+      return c.json({ error: 'InvalidRequest', message: 'DLQ name is required' }, 400);
+    }
+
+    const messages = await QueueService.inspectDLQ(dlqName);
+    return c.json(messages, 200);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to inspect DLQ';
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
+/**
+ * PUT /api/queues/:dlqName/messages/:messageId
+ * Edit/mutate message payload directly in the DLQ before re-driving
+ */
+queuesRoute.put('/:dlqName/messages/:messageId', async (c: Context) => {
+  try {
+    const dlqName = c.req.param('dlqName');
+    const messageId = c.req.param('messageId');
+    if (!dlqName || !messageId) {
+      return c.json({ error: 'InvalidRequest', message: 'DLQ name and message ID are required' }, 400);
+    }
+
+    const body = await c.req.json<{ body: string | Record<string, unknown> }>().catch(() => null);
+    if (!body || body.body === undefined || body.body === null) {
+      return c.json({ error: 'InvalidRequest', message: 'Updated message body is required' }, 400);
+    }
+
+    const updated = await QueueService.updateDLQMessage(dlqName, messageId, body.body);
+    return c.json(
+      {
+        success: true,
+        message: updated,
+      },
+      200
+    );
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to update DLQ message';
+    if (message.includes('not found')) {
+      return c.json({ error: 'MessageNotFound', message }, 404);
+    }
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
+/**
+ * POST /api/queues/:dlqName/redrive
+ * Bulk or selective re-drive messages from DLQ back to sourceQueue
+ */
+queuesRoute.post('/:dlqName/redrive', async (c: Context) => {
+  try {
+    const dlqName = c.req.param('dlqName');
+    if (!dlqName) {
+      return c.json({ error: 'InvalidRequest', message: 'DLQ name is required' }, 400);
+    }
+
+    const body = await c.req.json<{ messageIds?: string[] }>().catch(() => null);
+    const messageIds = body?.messageIds && Array.isArray(body.messageIds) ? body.messageIds : undefined;
+
+    const result = await QueueService.redriveMessages(dlqName, messageIds);
+    return c.json(result, 200);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to redrive DLQ messages';
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
+/**
+ * POST /api/queues/:name/messages/:id/fail
+ * Simulate consumer failure on an in-flight message (forces retry or DLQ transition)
+ */
+queuesRoute.post('/:name/messages/:id/fail', async (c: Context) => {
+  try {
+    const name = c.req.param('name');
+    const id = c.req.param('id');
+    if (!name || !id) {
+      return c.json({ error: 'InvalidRequest', message: 'Queue name and message ID are required' }, 400);
+    }
+
+    const result = await QueueService.simulateFailure(name, id);
+    if (!result.success) {
+      return c.json({ error: 'NotFound', message: `Message "${id}" was not in-flight in queue "${name}"` }, 404);
+    }
+
+    return c.json(
+      {
+        success: true,
+        messageId: id,
+        movedToDlq: result.movedToDlq,
+        receiveCount: result.currentReceiveCount,
+      },
+      200
+    );
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to simulate failure';
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
 export default queuesRoute;
