@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { nanoid } from 'nanoid';
 import { redis } from './redis';
+import { MetricsService } from './metrics-service';
 import type {
   QueueMeta,
   QueueType,
@@ -12,6 +13,7 @@ import type {
   ReceiveMessageResponse,
   ReceiveMessagesOptions,
   RedriveResponse,
+  BurstLoadResponse,
 } from '../types/queue';
 
 // Lua script to atomically receive up to N messages from ready queue and place into inflight ZSET.
@@ -254,6 +256,7 @@ local failedAt = ARGV[5]
 local errorTrace = ARGV[6]
 local nowIso = ARGV[7]
 local qType = ARGV[8] or 'standard'
+local customReason = ARGV[9]
 
 local msgKey = 'msg:' .. qName .. ':' .. msgId
 if redis.call('EXISTS', msgKey) == 0 then
@@ -264,6 +267,7 @@ end
 redis.call('ZREM', inflightKey, msgId)
 
 local newReceiveCount = redis.call('HINCRBY', msgKey, 'receiveCount', 1)
+local reason = (customReason and customReason ~= '') and customReason or ('MaxReceiveCountExceeded (Attempted ' .. newReceiveCount .. ' times)')
 
 if newReceiveCount > maxReceive then
   -- Exceeded! Move to DLQ
@@ -282,7 +286,6 @@ if newReceiveCount > maxReceive then
   local dlqMsgKey = 'msg:' .. dlqName .. ':' .. msgId
   redis.call('RENAME', msgKey, dlqMsgKey)
 
-  local reason = 'MaxReceiveCountExceeded (Attempted ' .. newReceiveCount .. ' times)'
   redis.call('HSET', dlqMsgKey,
     'failedAt', failedAt,
     'failureReason', reason,
@@ -293,8 +296,13 @@ if newReceiveCount > maxReceive then
   redis.call('RPUSH', dlqReadyKey, msgId)
   return { 1, 1, newReceiveCount } -- { success, movedToDlq, newReceiveCount }
 else
-  -- Return back to ready list with incremented receiveCount
+  -- Return back to ready list with incremented receiveCount and failure trace
   local readyKey = 'queue:' .. qName .. ':ready'
+  redis.call('HSET', msgKey,
+    'failedAt', failedAt,
+    'failureReason', reason,
+    'errorTrace', errorTrace
+  )
   redis.call('LPUSH', readyKey, msgId)
   return { 1, 0, newReceiveCount } -- { success, movedToDlq=0, newReceiveCount }
 end
@@ -307,6 +315,49 @@ export class QueueService {
   public static getDLQName(queueName: string): string {
     return `${queueName}-dlq`;
   }
+
+  /**
+   * Detect poison pill chaos payload and construct authentic runtime stack trace
+   */
+  public static getPoisonPillError(body: string | Record<string, unknown>): {
+    isPoisonPill: boolean;
+    failureReason: string;
+    errorTrace: string;
+  } | null {
+    try {
+      const data = typeof body === 'string' ? JSON.parse(body) : body;
+      if (!data || typeof data !== 'object') return null;
+
+      if (data.failProcessing !== true) {
+        return null;
+      }
+
+      if (data.simulateError === 'TypeError' || data.orderId === null) {
+        return {
+          isPoisonPill: true,
+          failureReason: "TypeError: Cannot read properties of null (reading 'orderId')",
+          errorTrace: "TypeError: Cannot read properties of null (reading 'orderId')\n    at OrderProcessor.execute (/var/task/worker.ts:42:15)\n    at processMessage (/var/task/handler.ts:89:12)\n    at Runtime.handleEvent (/var/runtime/index.ts:14:5)",
+        };
+      }
+
+      if (data.simulateError === 'SyntaxError' || (data.invalidXml && typeof data.invalidXml === 'string')) {
+        return {
+          isPoisonPill: true,
+          failureReason: "SyntaxError: Unexpected token '<' in JSON at position 0",
+          errorTrace: "SyntaxError: Unexpected token < in JSON at position 0\n    at XMLParser.parse (/var/task/worker.ts:88:22)\n    at OrderProcessor.execute (/var/task/worker.ts:45:18)\n    at processMessage (/var/task/handler.ts:89:12)",
+        };
+      }
+
+      return {
+        isPoisonPill: true,
+        failureReason: `${data.simulateError || 'ProcessingError'}: Chaos injection processing failure`,
+        errorTrace: `${data.simulateError || 'RuntimeError'}: Simulated chaos failure during worker processing\n    at OrderProcessor.execute (/var/task/worker.ts:42:15)\n    at processMessage (/var/task/handler.ts:89:12)`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
 
   /**
    * Validate queue name according to SQS specifications
@@ -570,6 +621,8 @@ export class QueueService {
       pipeline.rpush(`queue:${queueName}:ready`, messageId);
       await pipeline.exec();
 
+      await MetricsService.recordMetric(queueName, 'sent', 1);
+
       return {
         message: {
           id: messageId,
@@ -604,6 +657,8 @@ export class QueueService {
     pipeline.rpush(`queue:${queueName}:ready`, messageId);
     await pipeline.exec();
 
+    await MetricsService.recordMetric(queueName, 'sent', 1);
+
     return {
       message: {
         id: messageId,
@@ -617,6 +672,105 @@ export class QueueService {
       deduplicated: false,
     };
   }
+
+  /**
+   * Send a burst of randomized realistic messages using a Redis pipeline for maximum throughput
+   */
+  public static async sendBurstMessages(
+    queueName: string,
+    count = 25
+  ): Promise<BurstLoadResponse> {
+    const queue = await this.getQueue(queueName);
+    if (!queue) {
+      throw new Error(`Queue not found: ${queueName}`);
+    }
+
+    const safeCount = Math.min(100, Math.max(1, Number(count) || 25));
+    const messageIds: string[] = [];
+    const pipeline = redis.pipeline();
+    const enqueueTime = new Date().toISOString();
+
+    const customerNames = [
+      'Alex Mercer',
+      'Devon Vance',
+      'Elena Rostova',
+      'Marcus Brody',
+      'Sophia Lin',
+      'Kaito Tanaka',
+      'Zoe Martinez',
+      'Liam O\'Connor',
+      'Aria Sterling',
+      'Noah Kim',
+      'Amara Patel',
+      'Lucas Bennett',
+    ];
+
+    const categories = ['Electronics', 'Accessories', 'Cloud Infrastructure', 'Payments', 'Logistics'];
+    const statuses = ['CONFIRMED', 'PENDING_SETTLEMENT', 'PROCESSING', 'AUTHORIZED'];
+
+    for (let i = 0; i < safeCount; i++) {
+      const messageId = nanoid();
+      messageIds.push(messageId);
+
+      const customer = customerNames[Math.floor(Math.random() * customerNames.length)];
+      const category = categories[Math.floor(Math.random() * categories.length)];
+      const status = statuses[Math.floor(Math.random() * statuses.length)];
+      const orderNum = Math.floor(100000 + Math.random() * 900000);
+      const totalAmount = Number((Math.random() * 450 + 12.5).toFixed(2));
+      const itemsCount = Math.floor(Math.random() * 5) + 1;
+
+      const payload = {
+        orderId: `ord_${orderNum}`,
+        customer,
+        category,
+        itemsCount,
+        totalAmount,
+        currency: 'USD',
+        status,
+        traceId: `trc_${nanoid(12)}`,
+        burstIndex: i + 1,
+        timestamp: enqueueTime,
+      };
+
+      const bodyStr = JSON.stringify(payload);
+      const bytes = Buffer.byteLength(bodyStr, 'utf8');
+      const sizeKb = Number((bytes / 1024).toFixed(3));
+
+      const msgKey = `msg:${queueName}:${messageId}`;
+      const hashData: Record<string, string> = {
+        id: messageId,
+        body: bodyStr,
+        sizeKb: sizeKb.toString(),
+        enqueueTime,
+        receiveCount: '0',
+      };
+
+      if (queue.type === 'fifo') {
+        const groupId = `burst-stream-${(i % 5) + 1}`;
+        const dedupId = nanoid();
+        hashData.messageGroupId = groupId;
+        hashData.messageDeduplicationId = dedupId;
+        pipeline.set(`dedup:${queueName}:${dedupId}`, messageId, 'EX', 300);
+      }
+
+      pipeline.hset(msgKey, hashData);
+      pipeline.rpush(`queue:${queueName}:ready`, messageId);
+    }
+
+    await pipeline.exec();
+
+    // Record burst telemetry metric
+    await MetricsService.recordMetric(queueName, 'sent', safeCount);
+
+    return {
+      success: true,
+      queue: queueName,
+      count: safeCount,
+      messageIds,
+      enqueuedAt: enqueueTime,
+    };
+  }
+
 
   /**
    * Receive/Poll messages from queue with DLQ routing on maxReceiveCount exceeded
@@ -690,11 +844,29 @@ export class QueueService {
       console.log(
         `🚨 [DLQ Trigger] Moved ${movedToDlq.length} message(s) exceeding maxReceiveCount (${queue.maxReceiveCount}) from "${queueName}" to "${dlqName}"`
       );
+      await MetricsService.recordMetric(queueName, 'deadLettered', movedToDlq.length);
+
+      // Verify if any moved message is a poison pill chaos payload and ensure authentic stack trace
+      for (const dlqMsgId of movedToDlq) {
+        const dlqKey = `msg:${dlqName}:${dlqMsgId}`;
+        const raw = await redis.hgetall(dlqKey);
+        if (raw && raw.body) {
+          const poison = this.getPoisonPillError(raw.body);
+          if (poison) {
+            await redis.hset(dlqKey, {
+              failureReason: poison.failureReason,
+              errorTrace: poison.errorTrace,
+            });
+          }
+        }
+      }
     }
 
     if (pulledIds.length === 0) {
       return [];
     }
+
+    await MetricsService.recordMetric(queueName, 'received', pulledIds.length);
 
     // Retrieve metadata for successfully delivered messages
     const pipeline = redis.pipeline();
@@ -725,6 +897,15 @@ export class QueueService {
       }
     }
 
+    if (options.autoFail) {
+      for (const msg of messages) {
+        const poison = this.getPoisonPillError(msg.body);
+        if (poison) {
+          await this.simulateFailure(queueName, msg.id);
+        }
+      }
+    }
+
     return messages;
   }
 
@@ -733,11 +914,38 @@ export class QueueService {
    */
   public static async simulateFailure(
     queueName: string,
-    messageId: string
-  ): Promise<{ success: boolean; movedToDlq: boolean; currentReceiveCount: number }> {
+    messageId: string,
+    customError?: { errorTrace?: string; failureReason?: string }
+  ): Promise<{
+    success: boolean;
+    movedToDlq: boolean;
+    currentReceiveCount: number;
+    errorTrace?: string;
+    failureReason?: string;
+  }> {
     const queue = await this.getQueue(queueName);
     if (!queue) {
       throw new Error(`Queue not found: ${queueName}`);
+    }
+
+    const msgKey = `msg:${queueName}:${messageId}`;
+    const rawMsg = await redis.hgetall(msgKey);
+    if (!rawMsg || !rawMsg.id) {
+      return { success: false, movedToDlq: false, currentReceiveCount: 0 };
+    }
+
+    let errorTrace =
+      customError?.errorTrace ||
+      'ProcessingError: Consumer worker failed to acknowledge within VisibilityTimeout. Maximum retry threshold reached at worker-node-primary.';
+    let failureReason = customError?.failureReason || '';
+
+    // Check if the message contains a poison pill error payload
+    if (rawMsg.body) {
+      const poison = this.getPoisonPillError(rawMsg.body);
+      if (poison) {
+        errorTrace = customError?.errorTrace || poison.errorTrace;
+        failureReason = customError?.failureReason || poison.failureReason;
+      }
     }
 
     const inflightKey = `queue:${queueName}:inflight`;
@@ -745,8 +953,6 @@ export class QueueService {
     const dlqReadyKey = `queue:${dlqName}:ready`;
     const dlqMetaKey = `queue:${dlqName}:meta`;
     const nowIso = new Date().toISOString();
-    const errorTrace =
-      'ProcessingError: Consumer worker failed to acknowledge within VisibilityTimeout. Maximum retry threshold reached at worker-node-primary.';
 
     const res = (await redis.eval(
       SIMULATE_FAIL_LUA,
@@ -761,19 +967,27 @@ export class QueueService {
       nowIso,
       errorTrace,
       nowIso,
-      queue.type
+      queue.type,
+      failureReason
     )) as [number, number, number];
 
     const success = res[0] === 1;
     const movedToDlq = res[1] === 1;
     const currentReceiveCount = res[2];
 
+    if (movedToDlq) {
+      await MetricsService.recordMetric(queueName, 'deadLettered', 1);
+    }
+
     return {
       success,
       movedToDlq,
       currentReceiveCount,
+      errorTrace,
+      failureReason,
     };
   }
+
 
   /**
    * Inspect DLQ: list all messages in DLQ with error traces and metadata
@@ -910,6 +1124,10 @@ export class QueueService {
 
     const removedFromInFlight = res[0] > 0;
     const deleted = res[1] > 0;
+
+    if (deleted || removedFromInFlight) {
+      await MetricsService.recordMetric(queueName, 'deleted', 1);
+    }
 
     return {
       acknowledged: removedFromInFlight || deleted,

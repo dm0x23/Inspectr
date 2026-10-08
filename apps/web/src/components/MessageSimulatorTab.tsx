@@ -5,7 +5,8 @@ import {
   RefreshCw, 
   AlertCircle, 
   CheckCircle2,
-  Clock
+  Clock,
+  Zap,
 } from 'lucide-react';
 import type { Queue, Message } from '../types';
 import { ReceivedMessageCard } from './ReceivedMessageCard';
@@ -17,23 +18,27 @@ interface MessageSimulatorTabProps {
   onAcknowledgeMessage: (messageId: string) => Promise<void>;
   onSimulateFailure: (messageId: string) => Promise<void>;
   onPurgeQueue: () => Promise<void>;
+  onBurstLoad: (count?: number) => Promise<void>;
 }
 
-const SAMPLE_PAYLOADS = [
+const CHAOS_PRESETS = [
   {
-    name: 'order',
+    id: 'valid_order',
+    name: 'Valid Order',
     data: { orderId: 'ord_9871', customerId: 'cust_402', totalAmount: 149.99, currency: 'USD', status: 'CONFIRMED' },
     groupId: 'orders-stream',
   },
   {
-    name: 'payment',
-    data: { txnId: 'txn_5510', amount: 89.50, gateway: 'stripe', attempt: 1, cardLast4: '4242' },
-    groupId: 'payments-stream',
+    id: 'poison_null',
+    name: 'Poison Pill (Null Reference)',
+    data: { orderId: null, simulateError: 'TypeError', failProcessing: true },
+    groupId: 'orders-stream',
   },
   {
-    name: 'inventory',
-    data: { sku: 'PROD-MACBOOK-M3', warehouseId: 'wh_us_east', delta: -1, timestamp: new Date().toISOString() },
-    groupId: 'inventory-stream',
+    id: 'corrupted_schema',
+    name: 'Corrupted Schema',
+    data: { invalidXml: '<<<malformed>>>', simulateError: 'SyntaxError', failProcessing: true },
+    groupId: 'orders-stream',
   },
 ];
 
@@ -44,16 +49,19 @@ export const MessageSimulatorTab: React.FC<MessageSimulatorTabProps> = ({
   onAcknowledgeMessage,
   onSimulateFailure,
   onPurgeQueue,
+  onBurstLoad,
 }) => {
   // Producer State
+  const [activePresetId, setActivePresetId] = useState<string>('valid_order');
   const [producerPayload, setProducerPayload] = useState<string>(
-    JSON.stringify(SAMPLE_PAYLOADS[0].data, null, 2)
+    JSON.stringify(CHAOS_PRESETS[0].data, null, 2)
   );
   const [messageGroupId, setMessageGroupId] = useState<string>(
     queue?.type === 'fifo' ? 'orders-stream' : ''
   );
   const [dedupId, setDedupId] = useState<string>('');
   const [isSending, setIsSending] = useState(false);
+  const [isBursting, setIsBursting] = useState(false);
   const [producerError, setProducerError] = useState<string | null>(null);
   const [producerSuccess, setProducerSuccess] = useState<string | null>(null);
 
@@ -78,10 +86,26 @@ export const MessageSimulatorTab: React.FC<MessageSimulatorTabProps> = ({
   }, [queue?.name, queue?.type]);
 
   // Producer Handlers
-  const handleLoadSample = (sample: typeof SAMPLE_PAYLOADS[0]) => {
-    setProducerPayload(JSON.stringify(sample.data, null, 2));
+  const handleSelectPreset = (preset: typeof CHAOS_PRESETS[0]) => {
+    setActivePresetId(preset.id);
+    setProducerPayload(JSON.stringify(preset.data, null, 2));
     if (queue?.type === 'fifo') {
-      setMessageGroupId(sample.groupId);
+      setMessageGroupId(preset.groupId);
+    }
+  };
+
+  const handleSimulateBurst = async () => {
+    if (!queue) return;
+    setIsBursting(true);
+    setProducerError(null);
+    try {
+      await onBurstLoad(25);
+      setProducerSuccess('Traffic burst of 25 messages pipelined successfully');
+      setTimeout(() => setProducerSuccess(null), 3000);
+    } catch (err: unknown) {
+      setProducerError(err instanceof Error ? err.message : 'Burst simulation failed');
+    } finally {
+      setIsBursting(false);
     }
   };
 
@@ -134,6 +158,28 @@ export const MessageSimulatorTab: React.FC<MessageSimulatorTabProps> = ({
           const newUnique = messages.filter((m) => !existingIds.has(m.id));
           return [...newUnique, ...prev];
         });
+
+        // Feature 1: Consumer Simulator Poison Pill Auto-Fail Handling
+        const poisonPills = messages.filter((m) => {
+          try {
+            const parsed = JSON.parse(m.body);
+            return parsed && parsed.failProcessing === true;
+          } catch {
+            return false;
+          }
+        });
+
+        if (poisonPills.length > 0) {
+          for (const pill of poisonPills) {
+            try {
+              await onSimulateFailure(pill.id);
+              // Remove failed message from polled list
+              setReceivedMessages((prev) => prev.filter((m) => m.id !== pill.id));
+            } catch (err: unknown) {
+              console.error('Poison pill auto-fail error:', err);
+            }
+          }
+        }
       }
     } catch (err: unknown) {
       setPollError(err instanceof Error ? err.message : 'Failed to poll messages');
@@ -176,20 +222,6 @@ export const MessageSimulatorTab: React.FC<MessageSimulatorTabProps> = ({
               <h3 className="font-bold text-white text-base">Producer</h3>
               <p className="text-xs text-zinc-400 mt-1 font-mono">Publish messages to {queue?.name || 'queue'}</p>
             </div>
-
-            {/* Presets */}
-            <div className="flex items-center gap-2.5 flex-wrap">
-              <span className="text-xs text-zinc-500 font-mono hidden sm:inline">presets:</span>
-              {SAMPLE_PAYLOADS.map((sample) => (
-                <button
-                  key={sample.name}
-                  onClick={() => handleLoadSample(sample)}
-                  className="px-3 py-1.5 rounded border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white text-xs font-mono transition cursor-pointer shrink-0"
-                >
-                  {sample.name}
-                </button>
-              ))}
-            </div>
           </div>
 
           {/* Feedback banners (Red for error, Emerald for success) */}
@@ -208,22 +240,61 @@ export const MessageSimulatorTab: React.FC<MessageSimulatorTabProps> = ({
           )}
 
           <form onSubmit={handleSend} className="space-y-7">
-            {/* JSON Payload input */}
-            <div>
-              <div className="flex justify-between items-center mb-2.5 font-mono text-xs">
-                <label className="text-zinc-300 font-medium uppercase tracking-wider">Payload (JSON)</label>
-                <span className="text-zinc-500">
-                  {new TextEncoder().encode(producerPayload).length} bytes
-                </span>
+            {/* Feature 1: Preset selector with 3 pill buttons above the JSON payload editor */}
+            <div className="space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 font-mono text-xs">
+                <span className="text-zinc-400 font-medium">Presets</span>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {CHAOS_PRESETS.map((preset) => {
+                    const isSelected = activePresetId === preset.id;
+                    const isPoison = preset.id !== 'valid_order';
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => handleSelectPreset(preset)}
+                        className={`px-3 py-1.5 rounded-full text-xs font-mono transition flex items-center gap-1.5 cursor-pointer border shrink-0 ${
+                          isSelected
+                            ? 'bg-white text-black border-white font-semibold shadow-sm'
+                            : isPoison
+                            ? 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:text-red-300 hover:border-red-900/60'
+                            : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:text-white hover:border-zinc-700'
+                        }`}
+                      >
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            !isPoison
+                              ? isSelected ? 'bg-emerald-600' : 'bg-emerald-400'
+                              : isSelected ? 'bg-red-600' : 'bg-red-400'
+                          }`}
+                        />
+                        <span>{preset.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-              <textarea
-                rows={11}
-                value={producerPayload}
-                onChange={(e) => setProducerPayload(e.target.value)}
-                className="w-full bg-black border border-zinc-800 rounded-md p-5 text-sm font-mono text-zinc-100 focus:outline-none focus:border-zinc-500 transition leading-relaxed resize-y"
-                placeholder='{ "key": "value" }'
-                spellCheck={false}
-              />
+
+              {/* JSON Payload input */}
+              <div>
+                <div className="flex justify-between items-center mb-2.5 font-mono text-xs">
+                  <label className="text-zinc-300 font-medium uppercase tracking-wider">Payload (JSON)</label>
+                  <span className="text-zinc-500">
+                    {new TextEncoder().encode(producerPayload).length} bytes
+                  </span>
+                </div>
+                <textarea
+                  rows={11}
+                  value={producerPayload}
+                  onChange={(e) => {
+                    setProducerPayload(e.target.value);
+                    setActivePresetId('');
+                  }}
+                  className="w-full bg-black border border-zinc-800 rounded-md p-5 text-sm font-mono text-zinc-100 focus:outline-none focus:border-zinc-500 transition leading-relaxed resize-y"
+                  placeholder='{ "key": "value" }'
+                  spellCheck={false}
+                />
+              </div>
             </div>
 
             {/* FIFO Controls */}
@@ -273,15 +344,29 @@ export const MessageSimulatorTab: React.FC<MessageSimulatorTabProps> = ({
               </div>
             )}
 
-            {/* High-Contrast "Publish Message" CTA */}
-            <div className="pt-2">
+            {/* High-Contrast "Publish Message" CTA + Feature 2: Simulate Burst (25 msgs) */}
+            <div className="pt-2 space-y-3">
               <button
                 type="submit"
-                disabled={isSending || !queue}
+                disabled={isSending || isBursting || !queue}
                 className="w-full py-4 px-6 rounded-md bg-white hover:bg-zinc-200 text-black text-sm font-semibold transition active:scale-[0.99] disabled:opacity-50 flex items-center justify-center gap-2.5 cursor-pointer shadow-sm"
               >
                 <Send className="w-4 h-4 shrink-0" />
                 <span>{isSending ? 'Publishing...' : 'Publish Message'}</span>
+              </button>
+
+              {/* Feature 2: Simulate Burst Secondary Action */}
+              <button
+                type="button"
+                onClick={handleSimulateBurst}
+                disabled={isBursting || isSending || !queue}
+                className="w-full py-3 px-5 rounded-md border border-zinc-700 hover:border-zinc-500 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 hover:text-white text-xs font-mono font-medium transition active:scale-[0.99] disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer shadow-sm relative overflow-hidden"
+              >
+                {isBursting && (
+                  <div className="absolute inset-0 bg-white/5 animate-pulse w-full h-full" />
+                )}
+                <Zap className={`w-3.5 h-3.5 shrink-0 ${isBursting ? 'animate-spin text-white' : 'text-zinc-400'}`} />
+                <span>{isBursting ? 'Executing Burst (25 msgs)...' : 'Simulate Burst (25 msgs)'}</span>
               </button>
             </div>
           </form>

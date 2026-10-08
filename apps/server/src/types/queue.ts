@@ -57,6 +57,7 @@ export interface ReceiveMessagesOptions {
   maxMessages?: number;
   visibilityTimeout?: number;
   waitTimeSeconds?: number;
+  autoFail?: boolean;
 }
 
 export interface RedriveRequest {
@@ -73,3 +74,27 @@ export interface RedriveResponse {
 export interface UpdateDLQMessageInput {
   body: string | Record<string, unknown>;
 }
+
+export interface BurstLoadInput {
+  count?: number;
+}
+
+export interface BurstLoadResponse {
+  success: boolean;
+  queue: string;
+  count: number;
+  messageIds: string[];
+  enqueuedAt: string;
+}
+
+export interface QueueMetricPoint {
+  timestamp: number;
+  time: string;
+  ApproximateNumberOfMessagesVisible: number;
+  ApproximateNumberOfMessagesNotVisible: number;
+  NumberOfMessagesSent: number;
+  NumberOfMessagesReceived: number;
+  NumberOfMessagesDeleted: number;
+  NumberOfMessagesDeadLettered: number;
+}
+

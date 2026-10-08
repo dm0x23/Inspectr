@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { Hono } from 'hono';
+import { nanoid } from 'nanoid';
 import { redis } from '../lib/redis';
 import { QueueService } from '../lib/queue-service';
 import { queuesRoute } from '../routes/queues';
@@ -446,6 +447,164 @@ describe('Inspectr Core SQS Queue Engine', () => {
       expect(pollRes.length).toBe(1);
       expect(pollRes[0].receiveCount).toBe(1);
       expect(pollRes[0].body).toContain('"fixed": true');
+    });
+  });
+
+  describe('8. Poison Pill Chaos Injector', () => {
+    it('should inject authentic TypeError stack trace for null reference poison pill', async () => {
+      const chaosQueue = `chaos-tester-${nanoid()}`;
+      const chaosDlq = `${chaosQueue}-dlq`;
+
+      await QueueService.createQueue({
+        name: chaosQueue,
+        maxReceiveCount: 1, // Will move to DLQ on failure
+        visibilityTimeout: 30,
+      });
+
+      // Send Poison Pill (Null Reference)
+      const poisonPill = {
+        orderId: null,
+        simulateError: 'TypeError',
+        failProcessing: true,
+      };
+
+      const sendRes = await QueueService.sendMessage(chaosQueue, { body: poisonPill });
+      const msgId = sendRes.message.id;
+
+      // Poll message
+      const polled = await QueueService.receiveMessages(chaosQueue, { maxMessages: 1 });
+      expect(polled.length).toBe(1);
+      expect(polled[0].id).toBe(msgId);
+
+      // Simulate failure on this in-flight poison pill
+      const failRes = await app.request(`/api/queues/${chaosQueue}/messages/${msgId}/fail`, {
+        method: 'POST',
+      });
+
+      expect(failRes.status).toBe(200);
+      const failData = await failRes.json();
+      expect(failData.success).toBe(true);
+      expect(failData.movedToDlq).toBe(true); // Exceeded maxReceiveCount of 1
+      expect(failData.errorTrace).toContain("TypeError: Cannot read properties of null (reading 'orderId')");
+      expect(failData.errorTrace).toContain('/var/task/worker.ts:42:15');
+
+      // Inspect DLQ to verify persisted stack trace
+      const inspectRes = await app.request(`/api/queues/${chaosDlq}/inspector`);
+      expect(inspectRes.status).toBe(200);
+      const dlqMsgs = await inspectRes.json();
+      const found = dlqMsgs.find((m: any) => m.id === msgId);
+      expect(found).toBeDefined();
+      expect(found.errorTrace).toContain("TypeError: Cannot read properties of null (reading 'orderId')");
+    });
+
+    it('should inject authentic SyntaxError stack trace for corrupted schema poison pill', async () => {
+      const corruptQueue = `corrupt-tester-${nanoid()}`;
+      const corruptDlq = `${corruptQueue}-dlq`;
+
+      await QueueService.createQueue({
+        name: corruptQueue,
+        maxReceiveCount: 1,
+      });
+
+      const corruptedPill = {
+        invalidXml: '<<<malformed>>>',
+        simulateError: 'SyntaxError',
+        failProcessing: true,
+      };
+
+      const sendRes = await QueueService.sendMessage(corruptQueue, { body: corruptedPill });
+      const msgId = sendRes.message.id;
+
+      // Poll with autoFail=true
+      const polled = await QueueService.receiveMessages(corruptQueue, { maxMessages: 1, autoFail: true });
+      expect(polled.length).toBe(1);
+
+      // Should have moved to DLQ because maxReceiveCount=1 and failed
+      const dlqLen = await redis.llen(`queue:${corruptDlq}:ready`);
+      expect(dlqLen).toBe(1);
+
+      const inspectRes = await app.request(`/api/queues/${corruptDlq}/inspector`);
+      const dlqMsgs = await inspectRes.json();
+      expect(dlqMsgs[0].errorTrace).toContain('SyntaxError: Unexpected token < in JSON at position 0');
+      expect(dlqMsgs[0].errorTrace).toContain('XMLParser.parse (/var/task/worker.ts:88:22)');
+    });
+  });
+
+  describe('9. Traffic Burst Load Generator (Stress Tester)', () => {
+    it('should generate default 25 randomized messages in a single Redis pipeline', async () => {
+      const burstQueue = `burst-test-${nanoid()}`;
+      await QueueService.createQueue({ name: burstQueue });
+
+      const res = await app.request(`/api/queues/${burstQueue}/burst`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 25 }),
+      });
+
+      expect(res.status).toBe(201);
+      const data = await res.json();
+      expect(data.success).toBe(true);
+      expect(data.count).toBe(25);
+      expect(data.messageIds.length).toBe(25);
+      expect(data.enqueuedAt).toBeDefined();
+
+      // Verify ready list length in Redis
+      const readyLen = await redis.llen(`queue:${burstQueue}:ready`);
+      expect(readyLen).toBe(25);
+
+      // Check random message structure
+      const firstMsgId = data.messageIds[0];
+      const raw = await redis.hgetall(`msg:${burstQueue}:${firstMsgId}`);
+      expect(raw.id).toBe(firstMsgId);
+      const parsed = JSON.parse(raw.body);
+      expect(parsed.orderId).toBeDefined();
+      expect(parsed.customer).toBeDefined();
+      expect(parsed.totalAmount).toBeGreaterThan(0);
+    });
+
+    it('should clamp burst count to maximum 100', async () => {
+      const burstQueue = `burst-test-clamp-${nanoid()}`;
+      await QueueService.createQueue({ name: burstQueue });
+
+      const res = await app.request(`/api/queues/${burstQueue}/burst`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 500 }),
+      });
+
+      expect(res.status).toBe(201);
+      const data = await res.json();
+      expect(data.count).toBe(100);
+    });
+  });
+
+  describe('10. CloudWatch-Style Real-Time Telemetry & Metrics', () => {
+    it('should return rolling 30 intervals of time-series data', async () => {
+      const metricsQueue = `telemetry-metrics-${nanoid()}`;
+      await QueueService.createQueue({ name: metricsQueue });
+
+      // Trigger burst to create activity
+      await app.request(`/api/queues/${metricsQueue}/burst`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 10 }),
+      });
+
+      const res = await app.request(`/api/queues/${metricsQueue}/metrics?intervals=30`);
+      expect(res.status).toBe(200);
+
+      const dataPoints = await res.json();
+      expect(Array.isArray(dataPoints)).toBe(true);
+      expect(dataPoints.length).toBe(30);
+
+      const latest = dataPoints[dataPoints.length - 1];
+      expect(latest.timestamp).toBeDefined();
+      expect(latest.time).toBeDefined();
+      expect(latest.ApproximateNumberOfMessagesVisible).toBeGreaterThanOrEqual(10);
+      expect(latest.NumberOfMessagesSent).toBeGreaterThanOrEqual(10);
+      expect(latest.NumberOfMessagesReceived).toBeDefined();
+      expect(latest.NumberOfMessagesDeleted).toBeDefined();
+      expect(latest.NumberOfMessagesDeadLettered).toBeDefined();
     });
   });
 });

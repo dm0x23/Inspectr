@@ -64,8 +64,21 @@ export const ReceivedMessageCard: React.FC<ReceivedMessageCardProps> = ({
   const formattedCountdown = `00:${secondsLeft < 10 ? '0' : ''}${secondsLeft}s`;
   const isExpired = remainingMs <= 0;
 
+  const poisonInfo = (() => {
+    try {
+      const data = JSON.parse(message.body);
+      if (data && data.failProcessing === true) {
+        return {
+          isPoison: true,
+          errorType: data.simulateError || 'PoisonPill',
+        };
+      }
+    } catch {}
+    return null;
+  })();
+
   return (
-    <div className="bg-zinc-950 border border-zinc-800 hover:border-zinc-700 rounded-md p-7 sm:p-8 transition text-sm shadow-sm space-y-5">
+    <div className={`bg-zinc-950 border ${poisonInfo ? 'border-red-900/60 shadow-[0_0_15px_rgba(248,113,113,0.1)]' : 'border-zinc-800 hover:border-zinc-700'} rounded-md p-7 sm:p-8 transition text-sm shadow-sm space-y-5`}>
       {/* Top Header Row */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3 font-mono text-sm flex-wrap">
@@ -77,6 +90,12 @@ export const ReceivedMessageCard: React.FC<ReceivedMessageCardProps> = ({
               <span className="text-zinc-600">•</span>
               <span className="text-zinc-400">group:{message.messageGroupId}</span>
             </>
+          )}
+          {poisonInfo && (
+            <span className="px-2 py-0.5 rounded border border-red-900/60 bg-red-950/40 text-red-400 text-xs font-mono font-bold flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+              <span>CHAOS ({poisonInfo.errorType})</span>
+            </span>
           )}
         </div>
 

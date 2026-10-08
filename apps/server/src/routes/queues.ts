@@ -1,6 +1,7 @@
 import { Hono, type Context } from 'hono';
 import { QueueService } from '../lib/queue-service';
-import type { CreateQueueInput, SendMessageInput } from '../types/queue';
+import { MetricsService } from '../lib/metrics-service';
+import type { CreateQueueInput, SendMessageInput, BurstLoadInput } from '../types/queue';
 
 export const queuesRoute = new Hono();
 
@@ -127,11 +128,13 @@ queuesRoute.get('/:name/messages', async (c: Context) => {
     const waitTimeSeconds = c.req.query('waitTimeSeconds')
       ? Number(c.req.query('waitTimeSeconds'))
       : undefined;
+    const autoFail = c.req.query('autoFail') === 'true';
 
     const messages = await QueueService.receiveMessages(name, {
       maxMessages,
       visibilityTimeout,
       waitTimeSeconds,
+      autoFail,
     });
 
     return c.json(messages, 200);
@@ -289,7 +292,11 @@ queuesRoute.post('/:name/messages/:id/fail', async (c: Context) => {
       return c.json({ error: 'InvalidRequest', message: 'Queue name and message ID are required' }, 400);
     }
 
-    const result = await QueueService.simulateFailure(name, id);
+    const body = await c.req.json<{ errorTrace?: string; failureReason?: string }>().catch(() => null);
+    const result = await QueueService.simulateFailure(name, id, {
+      errorTrace: body?.errorTrace,
+      failureReason: body?.failureReason,
+    });
     if (!result.success) {
       return c.json({ error: 'NotFound', message: `Message "${id}" was not in-flight in queue "${name}"` }, 404);
     }
@@ -300,11 +307,62 @@ queuesRoute.post('/:name/messages/:id/fail', async (c: Context) => {
         messageId: id,
         movedToDlq: result.movedToDlq,
         receiveCount: result.currentReceiveCount,
+        errorTrace: result.errorTrace,
+        failureReason: result.failureReason,
       },
       200
     );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Failed to simulate failure';
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
+/**
+ * POST /api/queues/:name/burst
+ * Traffic Burst Load Generator (Stress Tester)
+ * Batch insert randomized realistic messages using Redis pipeline
+ */
+queuesRoute.post('/:name/burst', async (c: Context) => {
+  try {
+    const name = c.req.param('name');
+    if (!name) {
+      return c.json({ error: 'InvalidRequest', message: 'Queue name is required' }, 400);
+    }
+
+    const body = await c.req.json<BurstLoadInput>().catch(() => null);
+    const count = body?.count !== undefined ? Number(body.count) : 25;
+
+    const result = await QueueService.sendBurstMessages(name, count);
+    return c.json(result, 201);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to execute traffic burst';
+    if (message.includes('Queue not found')) {
+      return c.json({ error: 'QueueNotFound', message }, 404);
+    }
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
+/**
+ * GET /api/queues/:name/metrics
+ * CloudWatch-style real-time rolling metrics (last 15-30 intervals)
+ */
+queuesRoute.get('/:name/metrics', async (c: Context) => {
+  try {
+    const name = c.req.param('name');
+    if (!name) {
+      return c.json({ error: 'InvalidRequest', message: 'Queue name is required' }, 400);
+    }
+
+    const intervals = c.req.query('intervals')
+      ? Math.min(60, Math.max(5, Number(c.req.query('intervals'))))
+      : 30;
+
+    const metrics = await MetricsService.getMetrics(name, intervals);
+    return c.json(metrics, 200);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to retrieve queue metrics';
     return c.json({ error: 'InternalError', message }, 500);
   }
 });

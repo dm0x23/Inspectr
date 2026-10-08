@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { 
   Send, 
-  ShieldAlert
+  ShieldAlert,
+  Activity,
 } from 'lucide-react';
 import type { Queue, DLQMessage, HealthStatus, CreateQueueData } from './types';
 import { ApiClient } from './api/client';
@@ -10,13 +11,14 @@ import { MetricsCards } from './components/MetricsCards';
 import { CreateQueueModal } from './components/CreateQueueModal';
 import { MessageSimulatorTab } from './components/MessageSimulatorTab';
 import { DLQInspectorTab } from './components/DLQInspectorTab';
+import { CloudWatchTelemetryTab } from './components/CloudWatchTelemetryTab';
 import { InspectErrorModal } from './components/InspectErrorModal';
 import { EditPayloadModal } from './components/EditPayloadModal';
 
 export function App() {
   const [queues, setQueues] = useState<Queue[]>([]);
   const [selectedQueue, setSelectedQueue] = useState<Queue | null>(null);
-  const [activeTab, setActiveTab] = useState<'simulator' | 'dlq'>('simulator');
+  const [activeTab, setActiveTab] = useState<'simulator' | 'dlq' | 'telemetry'>('simulator');
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
@@ -184,6 +186,14 @@ export function App() {
     showToast(`Queue "${selectedQueue.name}" purged (${res.totalPurged} messages removed).`, 'info');
   };
 
+  // Traffic Burst Handler
+  const handleBurstLoad = async (count = 25) => {
+    if (!selectedQueue) throw new Error('No queue selected');
+    const res = await ApiClient.sendBurst(selectedQueue.name, count);
+    await Promise.all([loadQueues(selectedQueue.name), loadDLQMessages(selectedQueue)]);
+    showToast(`Traffic burst: ${res.count} messages pipelined into "${selectedQueue.name}"`, 'success');
+  };
+
   // DLQ: Bulk Redrive Handler
   const handleBulkRedrive = async () => {
     if (!selectedQueue) return;
@@ -304,6 +314,19 @@ export function App() {
                 </span>
               )}
             </button>
+
+            {/* Tab 3: CloudWatch Telemetry */}
+            <button
+              onClick={() => setActiveTab('telemetry')}
+              className={`flex items-center gap-3 py-4.5 px-5 text-sm font-semibold tracking-tight border-b-2 -mb-px transition cursor-pointer shrink-0 ${
+                activeTab === 'telemetry'
+                  ? 'border-white text-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              <Activity className="w-4 h-4 shrink-0" />
+              <span>CloudWatch Telemetry</span>
+            </button>
           </div>
 
           <div className="text-sm text-zinc-400 hidden sm:flex items-center gap-2.5 font-mono shrink-0">
@@ -323,6 +346,7 @@ export function App() {
             onAcknowledgeMessage={handleAcknowledgeMessage}
             onSimulateFailure={handleSimulateFailure}
             onPurgeQueue={handlePurgeQueue}
+            onBurstLoad={handleBurstLoad}
           />
         )}
 
@@ -337,6 +361,17 @@ export function App() {
             onEditPayload={(msg) => setEditingMessage(msg)}
             onRedriveBulk={handleBulkRedrive}
             onRedriveSingle={handleSingleRedrive}
+          />
+        )}
+
+        {/* Tab 3 Content: CloudWatch Telemetry */}
+        {activeTab === 'telemetry' && (
+          <CloudWatchTelemetryTab
+            queue={selectedQueue}
+            onRefreshAll={() => {
+              loadQueues(selectedQueue?.name);
+              loadDLQMessages(selectedQueue);
+            }}
           />
         )}
       </main>

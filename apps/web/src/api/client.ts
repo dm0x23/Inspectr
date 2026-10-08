@@ -4,6 +4,8 @@ import type {
   DLQMessage,
   HealthStatus,
   CreateQueueData,
+  BurstLoadResponse,
+  QueueMetricPoint,
 } from '../types';
 
 const API_BASE = '/api';
@@ -152,5 +154,22 @@ export class ApiClient {
     const json = await res.json();
     if (!res.ok) throw new Error(json.message || 'Failed to redrive DLQ messages');
     return json;
+  }
+
+  public static async sendBurst(queueName: string, count = 25): Promise<BurstLoadResponse> {
+    const res = await fetch(`${API_BASE}/queues/${encodeURIComponent(queueName)}/burst`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.message || 'Failed to simulate traffic burst');
+    return json;
+  }
+
+  public static async getMetrics(queueName: string, intervals = 30): Promise<QueueMetricPoint[]> {
+    const res = await fetch(`${API_BASE}/queues/${encodeURIComponent(queueName)}/metrics?intervals=${intervals}`);
+    if (!res.ok) throw new Error(`Failed to fetch telemetry metrics: ${res.statusText}`);
+    return res.json();
   }
 }

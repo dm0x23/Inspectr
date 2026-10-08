@@ -56,3 +56,23 @@ export interface CreateQueueData {
   visibilityTimeout: number;
   maxReceiveCount: number;
 }
+
+export interface BurstLoadResponse {
+  success: boolean;
+  queue: string;
+  count: number;
+  messageIds: string[];
+  enqueuedAt: string;
+}
+
+export interface QueueMetricPoint {
+  timestamp: number;
+  time: string;
+  ApproximateNumberOfMessagesVisible: number;
+  ApproximateNumberOfMessagesNotVisible: number;
+  NumberOfMessagesSent: number;
+  NumberOfMessagesReceived: number;
+  NumberOfMessagesDeleted: number;
+  NumberOfMessagesDeadLettered: number;
+}
+
