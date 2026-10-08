@@ -14,6 +14,8 @@ import type {
   ReceiveMessagesOptions,
   RedriveResponse,
   BurstLoadResponse,
+  DeleteQueueResponse,
+  PurgeQueueResponse,
 } from '../types/queue';
 
 // Lua script to atomically receive up to N messages from ready queue and place into inflight ZSET.
@@ -1142,8 +1144,9 @@ export class QueueService {
   public static async purgeQueue(
     queueName: string
   ): Promise<{ purgedReadyCount: number; purgedInFlightCount: number }> {
-    const queue = await this.getQueue(queueName);
-    if (!queue) {
+    const isMember = await redis.sismember('queues:all', queueName);
+    const metaExists = await redis.exists(`queue:${queueName}:meta`);
+    if (!isMember && !metaExists) {
       throw new Error(`Queue not found: ${queueName}`);
     }
 
@@ -1152,9 +1155,65 @@ export class QueueService {
 
     const res = (await redis.eval(PURGE_QUEUE_LUA, 2, readyKey, inflightKey, queueName)) as [number, number];
 
+    // Atomically reset queue depth telemetry to 0
+    await MetricsService.recordQueueDepth(queueName, 0, 0).catch(() => {});
+
     return {
       purgedReadyCount: res[0],
       purgedInFlightCount: res[1],
+    };
+  }
+
+  /**
+   * Delete a queue and its associated DLQ (if present)
+   */
+  public static async deleteQueue(
+    queueName: string
+  ): Promise<DeleteQueueResponse> {
+    const isMember = await redis.sismember('queues:all', queueName);
+    const metaExists = await redis.exists(`queue:${queueName}:meta`);
+    if (!isMember && !metaExists) {
+      throw new Error(`Queue not found: ${queueName}`);
+    }
+
+    const dlqName = `${queueName}-dlq`;
+    const dlqMember = await redis.sismember('queues:all', dlqName);
+    const dlqMetaExists = await redis.exists(`queue:${dlqName}:meta`);
+    const hasDlq = dlqMember || dlqMetaExists;
+
+    // 1. Purge messages for main queue first (deletes all msg:queueName:* and ready/inflight keys)
+    await this.purgeQueue(queueName).catch(() => {});
+
+    // 2. Remove main queue keys and membership
+    const pipeline = redis.pipeline();
+    pipeline.srem('queues:all', queueName);
+    pipeline.del(`queue:${queueName}:meta`);
+    pipeline.del(`queue:${queueName}:ready`);
+    pipeline.del(`queue:${queueName}:inflight`);
+    pipeline.del(`metrics:${queueName}:buckets`);
+
+    // 3. If associated DLQ exists, purge and delete it as well
+    if (hasDlq) {
+      await this.purgeQueue(dlqName).catch(() => {});
+      pipeline.srem('queues:all', dlqName);
+      pipeline.del(`queue:${dlqName}:meta`);
+      pipeline.del(`queue:${dlqName}:ready`);
+      pipeline.del(`queue:${dlqName}:inflight`);
+      pipeline.del(`metrics:${dlqName}:buckets`);
+    }
+
+    await pipeline.exec();
+
+    // 4. Reset queue depths in metrics
+    await MetricsService.recordQueueDepth(queueName, 0, 0).catch(() => {});
+    if (hasDlq) {
+      await MetricsService.recordQueueDepth(dlqName, 0, 0).catch(() => {});
+    }
+
+    return {
+      success: true,
+      deleted: queueName,
+      ...(hasDlq ? { deletedDlq: dlqName } : {}),
     };
   }
 

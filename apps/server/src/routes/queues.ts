@@ -41,6 +41,34 @@ queuesRoute.get('/:name', async (c: Context) => {
 });
 
 /**
+ * DELETE /api/queues/:name
+ * Delete queue and its associated DLQ
+ */
+queuesRoute.delete('/:name', async (c: Context) => {
+  try {
+    const name = c.req.param('name');
+    if (!name) {
+      return c.json({ error: 'InvalidRequest', message: 'Queue name is required' }, 400);
+    }
+    const result = await QueueService.deleteQueue(name);
+    return c.json(
+      {
+        success: true,
+        deleted: result.deleted,
+        ...(result.deletedDlq ? { deletedDlq: result.deletedDlq } : {}),
+      },
+      200
+    );
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to delete queue';
+    if (message.includes('Queue not found')) {
+      return c.json({ error: 'QueueNotFound', message }, 404);
+    }
+    return c.json({ error: 'InternalError', message }, 500);
+  }
+});
+
+/**
  * POST /api/queues
  * Create a queue
  */
@@ -189,6 +217,7 @@ queuesRoute.post('/:name/purge', async (c: Context) => {
     return c.json(
       {
         success: true,
+        purged: true,
         queue: name,
         purgedReady: result.purgedReadyCount,
         purgedInFlight: result.purgedInFlightCount,

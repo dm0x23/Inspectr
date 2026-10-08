@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, AlertCircle } from 'lucide-react';
+import { X, AlertCircle, Layers } from 'lucide-react';
 import type { CreateQueueData, QueueType } from '../types';
 
 interface CreateQueueModalProps {
@@ -71,48 +71,53 @@ export const CreateQueueModal: React.FC<CreateQueueModalProps> = ({ isOpen, onCl
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
-      <div className="relative w-full max-w-xl rounded-md bg-zinc-950 border border-zinc-800 shadow-2xl p-8 sm:p-10 overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-black/75 backdrop-blur-md animate-in fade-in duration-150">
+      <div className="relative w-full max-w-lg rounded-2xl bg-zinc-900/90 backdrop-blur-3xl border border-white/15 border-t-white/25 shadow-2xl p-7 sm:p-9 overflow-hidden ring-1 ring-white/10">
         {/* Header */}
-        <div className="flex items-center justify-between pb-5 border-b border-zinc-800">
-          <div>
-            <h3 className="text-base font-bold text-white">Create Queue</h3>
-            <p className="text-xs text-zinc-400 mt-1 font-mono">Configure new simulated distributed queue</p>
+        <div className="flex items-center justify-between pb-4 border-b border-white/10">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-white/5 border border-white/10 text-white">
+              <Layers className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white tracking-tight">Create Queue</h3>
+              <p className="text-xs text-zinc-400 font-mono mt-0.5">Configure new simulated distributed queue</p>
+            </div>
           </div>
           <button
             onClick={onClose}
-            className="p-2 rounded-md text-zinc-400 hover:text-white transition cursor-pointer shrink-0"
+            className="p-1.5 rounded-full text-zinc-400 hover:text-white hover:bg-white/10 transition cursor-pointer shrink-0"
           >
-            <X className="w-5 h-5 shrink-0" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
         {/* Error Alert */}
         {error && (
-          <div className="mt-6 p-4 rounded-md bg-red-950/30 border border-red-900/60 text-red-300 text-xs flex items-center gap-3 font-mono shadow-sm">
+          <div className="mt-5 p-3.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-200 text-xs flex items-center gap-2.5 font-mono shadow-sm">
             <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
             <span>{error}</span>
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="mt-7 space-y-6 text-sm font-mono">
-          {/* FIFO Queue Toggle */}
-          <div className="flex items-center justify-between p-5 rounded-md border border-zinc-800 bg-zinc-900/40">
+        <form onSubmit={handleSubmit} className="mt-6 space-y-5 text-xs font-mono">
+          {/* FIFO Queue Switch Toggle */}
+          <div className="flex items-center justify-between p-4 rounded-xl border border-white/10 bg-black/30 shadow-inner">
             <div>
-              <div className="flex items-center gap-3">
-                <span className="font-bold text-sm text-white">FIFO Queue</span>
+              <div className="flex items-center gap-2.5">
+                <span className="font-bold text-white text-xs">FIFO Queue</span>
                 <span
-                  className={`text-[11px] px-2.5 py-0.5 rounded font-mono font-semibold ${
+                  className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-medium border ${
                     type === 'fifo'
-                      ? 'bg-emerald-950/40 border border-emerald-900/60 text-emerald-400'
-                      : 'bg-zinc-800 border border-zinc-700 text-zinc-400'
+                      ? 'bg-white/15 border-white/20 text-white'
+                      : 'bg-white/5 border-white/5 text-zinc-400'
                   }`}
                 >
                   {type === 'fifo' ? '.fifo enforced' : 'standard queue'}
                 </span>
               </div>
-              <p className="text-xs text-zinc-400 mt-1.5 font-sans leading-relaxed">
-                Strict FIFO delivery order per Message Group ID with 5-minute SHA-256 deduplication.
+              <p className="text-[11px] text-zinc-400 mt-1 font-sans leading-relaxed">
+                Strict FIFO delivery order with 5-minute SHA-256 deduplication.
               </p>
             </div>
             <button
@@ -120,13 +125,13 @@ export const CreateQueueModal: React.FC<CreateQueueModalProps> = ({ isOpen, onCl
               role="switch"
               aria-checked={type === 'fifo'}
               onClick={() => handleTypeChange(type === 'fifo' ? 'standard' : 'fifo')}
-              className={`relative inline-flex h-7 w-13 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                type === 'fifo' ? 'bg-white' : 'bg-zinc-800'
+              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                type === 'fifo' ? 'bg-white' : 'bg-white/20'
               }`}
             >
               <span
-                className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-black shadow-lg ring-0 transition duration-200 ease-in-out ${
-                  type === 'fifo' ? 'translate-x-6' : 'translate-x-0'
+                className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-black shadow-lg ring-0 transition duration-200 ease-in-out ${
+                  type === 'fifo' ? 'translate-x-5' : 'translate-x-0'
                 }`}
               />
             </button>
@@ -134,26 +139,24 @@ export const CreateQueueModal: React.FC<CreateQueueModalProps> = ({ isOpen, onCl
 
           {/* Queue Name */}
           <div>
-            <div className="flex justify-between items-center mb-2.5 text-xs text-zinc-400 font-semibold uppercase tracking-wider">
+            <div className="flex justify-between items-center mb-1.5 text-[11px] text-zinc-400 uppercase tracking-wider font-semibold">
               <span>Queue Name</span>
               {type === 'fifo' && (
-                <span className="text-emerald-400 font-mono lowercase text-[11px]">must end with .fifo</span>
+                <span className="text-zinc-300 font-mono lowercase text-[10px]">must end with .fifo</span>
               )}
             </div>
-            <div className="relative">
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => handleNameChange(e.target.value)}
-                placeholder={type === 'fifo' ? 'e.g. orders.fifo' : 'e.g. standard-orders'}
-                className="w-full bg-black border border-zinc-800 text-white text-sm rounded-md px-4 py-3 focus:outline-none focus:border-zinc-500 transition placeholder:text-zinc-700"
-              />
-            </div>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => handleNameChange(e.target.value)}
+              placeholder={type === 'fifo' ? 'e.g. orders.fifo' : 'e.g. standard-orders'}
+              className="w-full bg-black/50 border border-white/10 text-white text-xs rounded-xl px-4 py-2.5 focus:outline-none focus:border-white/30 transition placeholder:text-zinc-600 shadow-inner"
+            />
           </div>
 
           {/* Visibility Timeout Slider */}
           <div>
-            <div className="flex justify-between items-center mb-2 text-xs text-zinc-400">
+            <div className="flex justify-between items-center mb-1.5 text-[11px] text-zinc-400">
               <span className="uppercase tracking-wider">Visibility Lease</span>
               <span className="text-white font-bold">{visibilityTimeout}s</span>
             </div>
@@ -169,7 +172,7 @@ export const CreateQueueModal: React.FC<CreateQueueModalProps> = ({ isOpen, onCl
 
           {/* Max Receive Count Slider */}
           <div>
-            <div className="flex justify-between items-center mb-2 text-xs text-zinc-400">
+            <div className="flex justify-between items-center mb-1.5 text-[11px] text-zinc-400">
               <span className="uppercase tracking-wider">Max Retries (DLQ)</span>
               <span className="text-white font-bold">{maxReceiveCount} attempts</span>
             </div>
@@ -183,19 +186,19 @@ export const CreateQueueModal: React.FC<CreateQueueModalProps> = ({ isOpen, onCl
             />
           </div>
 
-          {/* Actions */}
-          <div className="flex justify-end gap-3 pt-6 border-t border-zinc-800 font-sans">
+          {/* Actions with Apple Pill Buttons */}
+          <div className="flex justify-end gap-2.5 pt-5 border-t border-white/10">
             <button
               type="button"
               onClick={onClose}
-              className="px-5 py-2.5 text-sm text-zinc-400 hover:text-white border border-zinc-800 hover:bg-zinc-900 rounded-md transition cursor-pointer"
+              className="px-4 py-1.5 text-xs font-medium text-zinc-300 hover:text-white border border-white/10 hover:border-white/20 bg-white/5 hover:bg-white/10 rounded-full transition cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={isSubmitting}
-              className="px-6 py-2.5 text-sm font-semibold text-black bg-white hover:bg-zinc-200 rounded-md transition disabled:opacity-50 cursor-pointer shadow-sm"
+              className="px-5 py-1.5 text-xs font-semibold text-black bg-white/90 hover:bg-white active:scale-[0.98] rounded-full transition disabled:opacity-40 cursor-pointer shadow-lg shadow-white/5"
             >
               {isSubmitting ? 'Creating...' : 'Create Queue'}
             </button>

@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { 
-  Send, 
-  ShieldAlert,
-  Activity,
+  Layers,
+  Plus,
 } from 'lucide-react';
 import type { Queue, DLQMessage, HealthStatus, CreateQueueData } from './types';
 import { ApiClient } from './api/client';
@@ -14,6 +13,8 @@ import { DLQInspectorTab } from './components/DLQInspectorTab';
 import { CloudWatchTelemetryTab } from './components/CloudWatchTelemetryTab';
 import { InspectErrorModal } from './components/InspectErrorModal';
 import { EditPayloadModal } from './components/EditPayloadModal';
+import { PurgeQueueModal } from './components/PurgeQueueModal';
+import { DeleteQueueModal } from './components/DeleteQueueModal';
 
 export function App() {
   const [queues, setQueues] = useState<Queue[]>([]);
@@ -30,6 +31,8 @@ export function App() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [inspectingMessage, setInspectingMessage] = useState<DLQMessage | null>(null);
   const [editingMessage, setEditingMessage] = useState<DLQMessage | null>(null);
+  const [queueToPurge, setQueueToPurge] = useState<Queue | null>(null);
+  const [queueToDelete, setQueueToDelete] = useState<Queue | null>(null);
 
   // Toast / Status Notification
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
@@ -126,6 +129,38 @@ export function App() {
     showToast(`Queue "${result.queue.name}" created successfully!`, 'success');
   };
 
+  // Confirm Purge Queue Handler
+  const handleConfirmPurge = async (queueName: string) => {
+    const res = await ApiClient.purgeQueue(queueName);
+    await loadQueues(selectedQueue?.name);
+    if (selectedQueue?.name === queueName) {
+      await loadDLQMessages(selectedQueue);
+    }
+    showToast(`Queue "${queueName}" purged (${res.totalPurged} messages removed).`, 'info');
+  };
+
+  // Confirm Delete Queue Handler
+  const handleConfirmDelete = async (queueName: string) => {
+    await ApiClient.deleteQueue(queueName);
+    showToast(`Queue "${queueName}" and its resources deleted.`, 'info');
+
+    // Auto-switch to next available queue if the active queue was deleted
+    const remaining = queues.filter((q) => q.name !== queueName && q.name !== `${queueName}-dlq`);
+    const nextQueue = remaining.find((q) => !q.name.endsWith('-dlq')) || remaining[0] || null;
+
+    if (selectedQueue?.name === queueName) {
+      setSelectedQueue(nextQueue);
+    }
+    await loadQueues(nextQueue?.name);
+  };
+
+  // Copy Queue ARN Handler
+  const handleCopyArn = (q: Queue) => {
+    const arn = `arn:aws:sqs:us-east-1:123456789012:${q.name}`;
+    navigator.clipboard.writeText(arn);
+    showToast(`Copied ARN to clipboard: ${arn}`, 'info');
+  };
+
   // Send Message Handler
   const handleSendMessage = async (body: unknown, groupId?: string, dedupId?: string) => {
     if (!selectedQueue) throw new Error('No queue selected');
@@ -178,14 +213,6 @@ export function App() {
     }
   };
 
-  // Purge Queue Handler
-  const handlePurgeQueue = async () => {
-    if (!selectedQueue) return;
-    const res = await ApiClient.purgeQueue(selectedQueue.name);
-    await loadQueues(selectedQueue.name);
-    showToast(`Queue "${selectedQueue.name}" purged (${res.totalPurged} messages removed).`, 'info');
-  };
-
   // Traffic Burst Handler
   const handleBurstLoad = async (count = 25) => {
     if (!selectedQueue) throw new Error('No queue selected');
@@ -235,17 +262,17 @@ export function App() {
   const dlqCount = selectedQueue?.stats.dlqCount ?? dlqMessages.length;
 
   return (
-    <div className="min-h-screen bg-black text-zinc-100 flex flex-col font-sans antialiased selection:bg-zinc-800 selection:text-white w-full">
+    <div className="min-h-screen w-full bg-zinc-950 text-zinc-100 flex flex-col font-sans antialiased selection:bg-white/20 selection:text-white relative">
       {/* Toast Notification */}
       {toast && (
         <div className="fixed bottom-6 right-6 z-50 animate-in fade-in slide-in-from-bottom-2 duration-150">
           <div
-            className={`flex items-center gap-3 px-5 py-3 rounded-md shadow-2xl text-xs font-mono ${
+            className={`flex items-center gap-3 px-4 py-2.5 rounded-full shadow-2xl backdrop-blur-2xl text-xs font-mono border ${
               toast.type === 'error'
-                ? 'bg-red-950/60 border border-red-900/80 text-red-200'
+                ? 'bg-red-950/70 border-red-500/30 text-red-200'
                 : toast.type === 'success'
-                ? 'bg-zinc-900 border border-emerald-900/50 text-zinc-100'
-                : 'bg-zinc-900 border border-zinc-800 text-zinc-100'
+                ? 'bg-zinc-900/80 border-emerald-500/30 text-emerald-200'
+                : 'bg-zinc-900/80 border-white/10 text-zinc-200'
             }`}
           >
             <span
@@ -257,13 +284,16 @@ export function App() {
                   : 'bg-zinc-400'
               }`}
             />
-            <span className="font-sans text-sm font-medium">{toast.message}</span>
+            <span className="font-sans text-xs font-medium">{toast.message}</span>
           </div>
         </div>
       )}
 
-      {/* Top Header */}
+      {/* Edge-to-Edge Navigation Header */}
       <Header
+        activeTab={activeTab}
+        onChangeTab={setActiveTab}
+        dlqCount={dlqCount}
         queues={queues}
         selectedQueue={selectedQueue}
         onSelectQueue={(q) => setSelectedQueue(q)}
@@ -271,124 +301,95 @@ export function App() {
         onRefresh={handleManualRefresh}
         isRefreshing={isRefreshing}
         health={health}
+        onRequestPurgeQueue={(q) => setQueueToPurge(q)}
+        onRequestDeleteQueue={(q) => setQueueToDelete(q)}
+        onCopyArn={handleCopyArn}
       />
 
-      {/* Main Container - Full Width across the entire page with generous horizontal & vertical spacing */}
-      <main className="flex-1 w-full px-8 sm:px-16 lg:px-24 xl:px-32 2xl:px-40 py-14 lg:py-20 flex flex-col">
-        {/* Metrics Row */}
-        <MetricsCards
-          queue={selectedQueue}
-          onOpenDLQTab={() => setActiveTab('dlq')}
-        />
+      {/* Main Full-Screen Content Canvas */}
+      <main className="flex-1 w-full px-6 sm:px-10 lg:px-14 py-8 sm:py-10 flex flex-col">
+          {!selectedQueue ? (
+            /* Apple Empty State */
+            <div className="flex-1 flex flex-col items-center justify-center py-24 px-4 text-center my-auto">
+              <div className="w-16 h-16 rounded-2xl bg-white/5 border border-white/10 border-t-white/20 flex items-center justify-center text-zinc-400 mb-6 shadow-2xl backdrop-blur-xl">
+                <Layers className="w-8 h-8 text-zinc-400" />
+              </div>
+              <h2 className="text-xl font-bold text-white tracking-tight mb-2">No Queues Found</h2>
+              <p className="text-xs text-zinc-400 max-w-md mb-8 font-sans leading-relaxed">
+                Create your first simulated distributed queue to begin generating traffic bursts, injecting poison pill chaos, and analyzing real-time CloudWatch telemetry.
+              </p>
+              <button
+                onClick={() => setIsCreateModalOpen(true)}
+                className="flex items-center gap-2 bg-white/90 hover:bg-white active:scale-[0.98] text-black text-xs font-semibold px-5 py-2.5 rounded-full shadow-lg shadow-white/5 transition cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Create Your First Queue</span>
+              </button>
+            </div>
+          ) : (
+            <>
+              {/* Glass Floating Metrics Bar */}
+              <MetricsCards
+                queue={selectedQueue}
+                onOpenDLQTab={() => setActiveTab('dlq')}
+              />
 
-        {/* Tab Navigation Controls */}
-        <div className="flex items-center justify-between border-b border-zinc-800 mb-14 sm:mb-16 w-full gap-4">
-          <div className="flex items-center gap-6 sm:gap-8 flex-wrap">
-            {/* Tab 1: Message Simulator */}
-            <button
-              onClick={() => setActiveTab('simulator')}
-              className={`flex items-center gap-3 py-4.5 px-5 text-sm font-semibold tracking-tight border-b-2 -mb-px transition cursor-pointer shrink-0 ${
-                activeTab === 'simulator'
-                  ? 'border-white text-white'
-                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              <Send className="w-4 h-4 shrink-0" />
-              <span>Message Simulator</span>
-            </button>
-
-            {/* Tab 2: DLQ Inspector & Replay */}
-            <button
-              onClick={() => setActiveTab('dlq')}
-              className={`flex items-center gap-3 py-4.5 px-5 text-sm font-semibold tracking-tight border-b-2 -mb-px transition cursor-pointer shrink-0 ${
-                activeTab === 'dlq'
-                  ? 'border-white text-white'
-                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              <ShieldAlert className={`w-4 h-4 shrink-0 ${dlqCount > 0 ? 'text-red-400' : ''}`} />
-              <span>DLQ Inspector & Replay</span>
-              {dlqCount > 0 && (
-                <span className="ml-2.5 px-2.5 py-0.5 rounded border border-red-900/60 bg-red-950/40 text-red-400 text-xs font-mono font-bold shrink-0">
-                  {dlqCount}
-                </span>
+              {/* Tab 1 Content: Message Simulator */}
+              {activeTab === 'simulator' && (
+                <MessageSimulatorTab
+                  queue={selectedQueue}
+                  onSendMessage={handleSendMessage}
+                  onPollMessages={handlePollMessages}
+                  onAcknowledgeMessage={handleAcknowledgeMessage}
+                  onSimulateFailure={handleSimulateFailure}
+                  onPurgeQueue={async () => {
+                    setQueueToPurge(selectedQueue);
+                  }}
+                  onBurstLoad={handleBurstLoad}
+                />
               )}
-            </button>
 
-            {/* Tab 3: CloudWatch Telemetry */}
-            <button
-              onClick={() => setActiveTab('telemetry')}
-              className={`flex items-center gap-3 py-4.5 px-5 text-sm font-semibold tracking-tight border-b-2 -mb-px transition cursor-pointer shrink-0 ${
-                activeTab === 'telemetry'
-                  ? 'border-white text-white'
-                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              <Activity className="w-4 h-4 shrink-0" />
-              <span>CloudWatch Telemetry</span>
-            </button>
-          </div>
+              {/* Tab 2 Content: DLQ Inspector & Replay */}
+              {activeTab === 'dlq' && (
+                <DLQInspectorTab
+                  queue={selectedQueue}
+                  dlqMessages={dlqMessages}
+                  isLoading={isLoadingDLQ}
+                  onRefreshDLQ={() => loadDLQMessages(selectedQueue)}
+                  onInspectError={(msg) => setInspectingMessage(msg)}
+                  onEditPayload={(msg) => setEditingMessage(msg)}
+                  onRedriveBulk={handleBulkRedrive}
+                  onRedriveSingle={handleSingleRedrive}
+                />
+              )}
 
-          <div className="text-sm text-zinc-400 hidden sm:flex items-center gap-2.5 font-mono shrink-0">
-            <span>target queue:</span>
-            <span className="px-3 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-white font-medium text-xs shadow-sm">
-              {selectedQueue?.name || 'none'}
-            </span>
-          </div>
+              {/* Tab 3 Content: CloudWatch Telemetry */}
+              {activeTab === 'telemetry' && (
+                <CloudWatchTelemetryTab
+                  queue={selectedQueue}
+                  onRefreshAll={() => {
+                    loadQueues(selectedQueue?.name);
+                    loadDLQMessages(selectedQueue);
+                  }}
+                />
+              )}
+            </>
+          )}
+        </main>
+
+      {/* Full-Width Status Bar (Footer) */}
+      <footer className="border-t border-white/10 bg-black/40 backdrop-blur-xl py-4 px-6 sm:px-10 lg:px-14 text-[11px] text-zinc-500 flex flex-col sm:flex-row items-center justify-between gap-3 font-mono mt-auto">
+        <div className="flex items-center gap-2.5">
+          <span className="font-semibold text-zinc-400">Inspectr</span>
+          <span className="text-zinc-700">•</span>
+          <span>Distributed Queue Simulator &amp; Visual Console</span>
         </div>
-
-        {/* Tab 1 Content: Message Simulator */}
-        {activeTab === 'simulator' && (
-          <MessageSimulatorTab
-            queue={selectedQueue}
-            onSendMessage={handleSendMessage}
-            onPollMessages={handlePollMessages}
-            onAcknowledgeMessage={handleAcknowledgeMessage}
-            onSimulateFailure={handleSimulateFailure}
-            onPurgeQueue={handlePurgeQueue}
-            onBurstLoad={handleBurstLoad}
-          />
-        )}
-
-        {/* Tab 2 Content: DLQ Inspector & Replay */}
-        {activeTab === 'dlq' && (
-          <DLQInspectorTab
-            queue={selectedQueue}
-            dlqMessages={dlqMessages}
-            isLoading={isLoadingDLQ}
-            onRefreshDLQ={() => loadDLQMessages(selectedQueue)}
-            onInspectError={(msg) => setInspectingMessage(msg)}
-            onEditPayload={(msg) => setEditingMessage(msg)}
-            onRedriveBulk={handleBulkRedrive}
-            onRedriveSingle={handleSingleRedrive}
-          />
-        )}
-
-        {/* Tab 3 Content: CloudWatch Telemetry */}
-        {activeTab === 'telemetry' && (
-          <CloudWatchTelemetryTab
-            queue={selectedQueue}
-            onRefreshAll={() => {
-              loadQueues(selectedQueue?.name);
-              loadDLQMessages(selectedQueue);
-            }}
-          />
-        )}
-      </main>
-
-      {/* Footer - Full Width with generous padding */}
-      <footer className="border-t border-zinc-900 bg-black py-10 text-xs text-zinc-500 mt-auto w-full">
-        <div className="w-full px-8 sm:px-16 lg:px-24 xl:px-32 2xl:px-40 flex flex-col sm:flex-row items-center justify-between gap-4 font-mono text-xs">
-          <div className="flex items-center gap-3">
-            <span className="font-bold text-zinc-300 text-sm">inspectr</span>
-            <span className="text-zinc-700">•</span>
-            <span className="text-zinc-400">SQS Distributed Queue Engine & Visual DLQ Console</span>
-          </div>
-          <div className="flex items-center gap-3 text-zinc-500">
-            <span>api: :3001</span>
-            <span className="text-zinc-800">•</span>
-            <span>redis: :6379</span>
-          </div>
+        <div className="flex items-center gap-3 text-zinc-500">
+          <span>api: :3001</span>
+          <span className="text-zinc-800">•</span>
+          <span>redis: :6379</span>
+          <span className="text-zinc-800">•</span>
+          <span>Full Screen Console</span>
         </div>
       </footer>
 
@@ -414,6 +415,22 @@ export function App() {
         message={editingMessage}
         onClose={() => setEditingMessage(null)}
         onSave={handleSaveEditedPayload}
+      />
+
+      {/* Purge Queue Confirmation Modal */}
+      <PurgeQueueModal
+        isOpen={!!queueToPurge}
+        queue={queueToPurge}
+        onClose={() => setQueueToPurge(null)}
+        onConfirmPurge={handleConfirmPurge}
+      />
+
+      {/* Delete Queue Danger Confirmation Modal */}
+      <DeleteQueueModal
+        isOpen={!!queueToDelete}
+        queue={queueToDelete}
+        onClose={() => setQueueToDelete(null)}
+        onConfirmDelete={handleConfirmDelete}
       />
     </div>
   );

@@ -2,11 +2,17 @@ import React from 'react';
 import { 
   Plus, 
   RefreshCw, 
-  ChevronDown
+  Zap, 
+  Search, 
+  Activity 
 } from 'lucide-react';
 import type { Queue, HealthStatus } from '../types';
+import { QueueSwitcher } from './QueueSwitcher';
 
 interface HeaderProps {
+  activeTab: 'simulator' | 'dlq' | 'telemetry';
+  onChangeTab: (tab: 'simulator' | 'dlq' | 'telemetry') => void;
+  dlqCount?: number;
   queues: Queue[];
   selectedQueue: Queue | null;
   onSelectQueue: (queue: Queue) => void;
@@ -14,9 +20,15 @@ interface HeaderProps {
   onRefresh: () => void;
   isRefreshing: boolean;
   health: HealthStatus | null;
+  onRequestPurgeQueue: (queue: Queue) => void;
+  onRequestDeleteQueue: (queue: Queue) => void;
+  onCopyArn: (queue: Queue) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
+  activeTab,
+  onChangeTab,
+  dlqCount = 0,
   queues,
   selectedQueue,
   onSelectQueue,
@@ -24,79 +36,157 @@ export const Header: React.FC<HeaderProps> = ({
   onRefresh,
   isRefreshing,
   health,
+  onRequestPurgeQueue,
+  onRequestDeleteQueue,
+  onCopyArn,
 }) => {
   const isHealthy = health?.status === 'healthy';
-  const nonDlqQueues = queues.filter((q) => !q.name.endsWith('-dlq'));
 
   return (
-    <header className="border-b border-zinc-800 bg-black/95 backdrop-blur-md sticky top-0 z-40">
-      <div className="w-full px-8 sm:px-16 lg:px-24 xl:px-32 2xl:px-40 h-18 sm:h-20 flex items-center justify-between gap-6">
-        {/* Left: Clean Wordmark */}
-        <div className="flex items-center gap-8 sm:gap-10">
-          <div className="flex items-center gap-3 shrink-0">
-            <span className="font-bold text-base sm:text-lg text-white tracking-tight">inspectr</span>
-            <span className="text-xs uppercase font-mono tracking-wider px-2.5 py-1 rounded border border-zinc-800 text-zinc-400 bg-zinc-950 shrink-0">
-              sqs
-            </span>
-          </div>
-
-          {/* Queue Switcher Dropdown */}
-          <div className="relative shrink-0">
-            <select
-              value={selectedQueue?.name || ''}
-              onChange={(e) => {
-                const q = queues.find((item) => item.name === e.target.value);
-                if (q) onSelectQueue(q);
-              }}
-              className="appearance-none bg-zinc-950 border border-zinc-800 hover:border-zinc-700 text-zinc-100 text-sm rounded-md pl-4 pr-11 py-2.5 min-w-[240px] max-w-[340px] truncate focus:outline-none focus:border-zinc-500 transition cursor-pointer font-mono shadow-sm"
-            >
-              {nonDlqQueues.length === 0 ? (
-                <option value="">No queues available</option>
-              ) : (
-                nonDlqQueues.map((q) => (
-                  <option key={q.name} value={q.name}>
-                    {q.name} ({q.type}) • {q.stats.totalApproximate}
-                  </option>
-                ))
-              )}
-            </select>
-            <ChevronDown className="w-4 h-4 text-zinc-500 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none shrink-0" />
-          </div>
+    <header className="border-b border-white/10 bg-zinc-950/70 backdrop-blur-2xl sticky top-0 z-40 border-t border-t-white/20 select-none">
+      <div className="w-full px-6 sm:px-10 h-16 sm:h-18 flex items-center justify-between gap-4">
+        {/* Left Side: Clean Wordmark */}
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="font-bold text-sm sm:text-base text-white tracking-tight">Inspectr</span>
+          <span className="text-[10px] uppercase font-mono tracking-wider px-2 py-0.5 rounded-full border border-white/10 text-zinc-400 bg-white/5 shrink-0">
+            sqs
+          </span>
         </div>
 
-        {/* Right: Actions & Status */}
-        <div className="flex items-center gap-5 shrink-0">
-          {/* Subtle Emerald / Red Redis Status */}
-          <div className="hidden sm:flex items-center gap-2.5 text-xs font-mono shrink-0">
+        {/* Center: Safari / macOS Segmented Pill Control */}
+        <div className="hidden md:flex items-center bg-black/40 border border-white/10 rounded-full p-1 backdrop-blur-xl shadow-inner">
+          <button
+            type="button"
+            onClick={() => onChangeTab('simulator')}
+            className={`flex items-center gap-2 px-4 py-1.5 text-xs rounded-full transition-all cursor-pointer ${
+              activeTab === 'simulator'
+                ? 'bg-white/10 backdrop-blur-sm text-white shadow-sm border border-white/10 font-medium'
+                : 'text-zinc-400 hover:text-white hover:bg-white/[0.04]'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+            <span>Message Simulator</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onChangeTab('dlq')}
+            className={`flex items-center gap-2 px-4 py-1.5 text-xs rounded-full transition-all cursor-pointer ${
+              activeTab === 'dlq'
+                ? 'bg-white/10 backdrop-blur-sm text-white shadow-sm border border-white/10 font-medium'
+                : 'text-zinc-400 hover:text-white hover:bg-white/[0.04]'
+            }`}
+          >
+            <Search className="w-3.5 h-3.5 shrink-0 text-zinc-400" />
+            <span>DLQ Inspector</span>
+            {dlqCount > 0 && (
+              <span className="ml-1 px-1.5 py-0.2 rounded-full bg-red-500/20 text-red-300 text-[10px] font-mono border border-red-500/30">
+                {dlqCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onChangeTab('telemetry')}
+            className={`flex items-center gap-2 px-4 py-1.5 text-xs rounded-full transition-all cursor-pointer ${
+              activeTab === 'telemetry'
+                ? 'bg-white/10 backdrop-blur-sm text-white shadow-sm border border-white/10 font-medium'
+                : 'text-zinc-400 hover:text-white hover:bg-white/[0.04]'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5 shrink-0 text-blue-400" />
+            <span>Telemetry</span>
+          </button>
+        </div>
+
+        {/* Right Side: Glassy Queue Selector Pill + Status Pill + Actions */}
+        <div className="flex items-center gap-3 shrink-0">
+          {/* Glassy Queue Selector Pill */}
+          <QueueSwitcher
+            queues={queues}
+            selectedQueue={selectedQueue}
+            onSelectQueue={onSelectQueue}
+            onOpenCreateModal={onOpenCreateModal}
+            onRequestPurgeQueue={onRequestPurgeQueue}
+            onRequestDeleteQueue={onRequestDeleteQueue}
+            onCopyArn={onCopyArn}
+          />
+
+          {/* Connection Status Pill */}
+          <div className="hidden lg:flex items-center gap-2 text-xs font-mono bg-white/5 border border-white/10 rounded-full px-3 py-1 text-zinc-300">
             <span
               className={`w-2 h-2 rounded-full shrink-0 ${
                 isHealthy
-                  ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]'
-                  : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]'
+                  ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]'
+                  : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]'
               }`}
             />
-            <span className={isHealthy ? 'text-zinc-300' : 'text-red-400 font-medium'}>
-              {isHealthy ? 'redis connected' : 'redis offline'}
-            </span>
+            <span className="text-[11px]">{isHealthy ? 'redis online' : 'redis offline'}</span>
           </div>
 
           {/* Refresh Button */}
           <button
+            type="button"
             onClick={onRefresh}
             disabled={isRefreshing}
-            className="p-3 rounded-md border border-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-900 transition disabled:opacity-50 cursor-pointer shrink-0"
+            className="p-2 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-400 hover:text-white transition disabled:opacity-50 cursor-pointer shadow-sm"
             title="Refresh metrics"
           >
-            <RefreshCw className={`w-4 h-4 shrink-0 ${isRefreshing ? 'animate-spin text-emerald-400' : ''}`} />
+            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-emerald-400' : ''}`} />
           </button>
 
-          {/* Primary High-Contrast "New Queue" Button */}
+          {/* Primary CTA Glass Pill */}
           <button
+            type="button"
             onClick={onOpenCreateModal}
-            className="flex items-center gap-2.5 bg-white hover:bg-zinc-200 text-black text-sm font-semibold px-5 py-2.5 rounded-md transition active:scale-[0.98] cursor-pointer shadow-sm shrink-0"
+            className="flex items-center gap-1.5 bg-white/90 hover:bg-white active:scale-[0.98] text-black text-xs font-semibold px-4 py-1.5 rounded-full shadow-lg shadow-white/5 transition cursor-pointer"
           >
-            <Plus className="w-4 h-4 shrink-0" />
+            <Plus className="w-3.5 h-3.5" />
             <span>New Queue</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Mobile segmented control when screen is narrow */}
+      <div className="md:hidden flex items-center justify-center p-2 border-t border-white/5 bg-black/40 backdrop-blur-xl">
+        <div className="flex items-center bg-zinc-900/60 border border-white/10 rounded-full p-1 w-full max-w-sm justify-between">
+          <button
+            type="button"
+            onClick={() => onChangeTab('simulator')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-1 text-xs rounded-full transition-all ${
+              activeTab === 'simulator'
+                ? 'bg-white/10 text-white font-medium border border-white/10'
+                : 'text-zinc-400'
+            }`}
+          >
+            <Zap className="w-3 h-3 text-amber-400" />
+            <span>Simulator</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onChangeTab('dlq')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-1 text-xs rounded-full transition-all ${
+              activeTab === 'dlq'
+                ? 'bg-white/10 text-white font-medium border border-white/10'
+                : 'text-zinc-400'
+            }`}
+          >
+            <Search className="w-3 h-3" />
+            <span>DLQ</span>
+            {dlqCount > 0 && <span className="text-[9px] text-red-400 font-mono">({dlqCount})</span>}
+          </button>
+          <button
+            type="button"
+            onClick={() => onChangeTab('telemetry')}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-1 text-xs rounded-full transition-all ${
+              activeTab === 'telemetry'
+                ? 'bg-white/10 text-white font-medium border border-white/10'
+                : 'text-zinc-400'
+            }`}
+          >
+            <Activity className="w-3 h-3 text-blue-400" />
+            <span>Telemetry</span>
           </button>
         </div>
       </div>

@@ -607,4 +607,74 @@ describe('Inspectr Core SQS Queue Engine', () => {
       expect(latest.NumberOfMessagesDeadLettered).toBeDefined();
     });
   });
+
+  describe('11. Queue Lifecycle & Deletion Engine', () => {
+    it('should purge ready and in-flight messages and return purged: true while keeping queue config', async () => {
+      const purgeQueueName = `lifecycle-purge-${nanoid()}`;
+      await QueueService.createQueue({ name: purgeQueueName, visibilityTimeout: 45 });
+      await QueueService.sendMessage(purgeQueueName, { body: 'purge-me-1' });
+      await QueueService.sendMessage(purgeQueueName, { body: 'purge-me-2' });
+      await QueueService.receiveMessages(purgeQueueName, { maxMessages: 1 });
+
+      const res = await app.request(`/api/queues/${purgeQueueName}/purge`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.success).toBe(true);
+      expect(data.purged).toBe(true);
+      expect(data.purgedReady).toBe(1);
+      expect(data.purgedInFlight).toBe(1);
+
+      // Queue config must still exist
+      const q = await QueueService.getQueue(purgeQueueName);
+      expect(q).not.toBeNull();
+      expect(q?.visibilityTimeout).toBe(45);
+      expect(q?.stats.readyCount).toBe(0);
+      expect(q?.stats.inFlightCount).toBe(0);
+    });
+
+    it('should delete a queue and its associated DLQ cleanly via DELETE /api/queues/:name', async () => {
+      const deleteQueueName = `lifecycle-del-${nanoid()}`;
+      const dlqName = `${deleteQueueName}-dlq`;
+      
+      // Create main queue and simulate a DLQ
+      await QueueService.createQueue({ name: deleteQueueName, maxReceiveCount: 1 });
+      await QueueService.sendMessage(deleteQueueName, { body: 'failing-message' });
+      
+      // Poll and fail to generate DLQ and messages
+      const msgs = await QueueService.receiveMessages(deleteQueueName, { maxMessages: 1 });
+      await QueueService.simulateFailure(deleteQueueName, msgs[0].id);
+
+      // Check both exist
+      expect(await redis.sismember('queues:all', deleteQueueName)).toBe(1);
+      expect(await redis.sismember('queues:all', dlqName)).toBe(1);
+      expect(await redis.exists(`queue:${deleteQueueName}:meta`)).toBe(1);
+      expect(await redis.exists(`queue:${dlqName}:meta`)).toBe(1);
+
+      // Delete via API
+      const res = await app.request(`/api/queues/${deleteQueueName}`, { method: 'DELETE' });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.success).toBe(true);
+      expect(data.deleted).toBe(deleteQueueName);
+
+      // Verify removed from queues:all
+      expect(await redis.sismember('queues:all', deleteQueueName)).toBe(0);
+      expect(await redis.sismember('queues:all', dlqName)).toBe(0);
+
+      // Verify metadata and queues are deleted
+      expect(await redis.exists(`queue:${deleteQueueName}:meta`)).toBe(0);
+      expect(await redis.exists(`queue:${deleteQueueName}:ready`)).toBe(0);
+      expect(await redis.exists(`queue:${deleteQueueName}:inflight`)).toBe(0);
+      expect(await redis.exists(`queue:${dlqName}:meta`)).toBe(0);
+      expect(await redis.exists(`queue:${dlqName}:ready`)).toBe(0);
+      expect(await redis.exists(`queue:${dlqName}:inflight`)).toBe(0);
+    });
+
+    it('should return 404 when attempting to delete non-existent queue', async () => {
+      const res = await app.request('/api/queues/non-existent-random-queue', { method: 'DELETE' });
+      expect(res.status).toBe(404);
+      const data = await res.json();
+      expect(data.error).toBe('QueueNotFound');
+    });
+  });
 });

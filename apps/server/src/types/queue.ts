@@ -98,3 +98,18 @@ export interface QueueMetricPoint {
   NumberOfMessagesDeadLettered: number;
 }
 
+export interface DeleteQueueResponse {
+  success: boolean;
+  deleted: string;
+  deletedDlq?: string;
+}
+
+export interface PurgeQueueResponse {
+  success: boolean;
+  purged: boolean;
+  queue: string;
+  purgedReady: number;
+  purgedInFlight: number;
+  totalPurged: number;
+}
+

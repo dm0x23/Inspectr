@@ -6,6 +6,8 @@ import type {
   CreateQueueData,
   BurstLoadResponse,
   QueueMetricPoint,
+  DeleteQueueResponse,
+  PurgeQueueResponse,
 } from '../types';
 
 const API_BASE = '/api';
@@ -106,12 +108,21 @@ export class ApiClient {
     return json;
   }
 
-  public static async purgeQueue(queueName: string): Promise<{ totalPurged: number }> {
+  public static async purgeQueue(queueName: string): Promise<PurgeQueueResponse> {
     const res = await fetch(`${API_BASE}/queues/${encodeURIComponent(queueName)}/purge`, {
       method: 'POST',
     });
     const json = await res.json();
     if (!res.ok) throw new Error(json.message || 'Failed to purge queue');
+    return json;
+  }
+
+  public static async deleteQueue(queueName: string): Promise<DeleteQueueResponse> {
+    const res = await fetch(`${API_BASE}/queues/${encodeURIComponent(queueName)}`, {
+      method: 'DELETE',
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.message || 'Failed to delete queue');
     return json;
   }
 
